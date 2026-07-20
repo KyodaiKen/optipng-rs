@@ -1,0 +1,6 @@
+[submodule "png_stream_dec"]
+	path = png_stream_dec
+	url = git@github.com:KyodaiKen/png_stream_dec.git
+[submodule "png_stream_enc"]
+	path = png_stream_enc
+	url = git@github.com:KyodaiKen/png_stream_enc.git

@@ -1,0 +1,9 @@
+[workspace]
+members = ["png_stream_dec/decoder", "png_stream_enc/encoder", "optipng-rs"]
+resolver = "2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'abort'
+strip = 'symbols'
