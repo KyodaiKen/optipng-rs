@@ -46,7 +46,7 @@ Ensure you have a modern Rust toolchain installed.
 
 ```bash
 # Clone the repository
-git clone [https://github.com/your-username/optipng-rs.git](https://github.com/your-username/optipng-rs.git)
+git clone [https://github.com/KyodaiKen/optipng-rs.git](https://github.com/KyodaiKen/optipng-rs.git)
 cd optipng-rs
 
 # Build release binary
