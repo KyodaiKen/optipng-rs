@@ -47,11 +47,11 @@ struct CliArgs {
 /// Translates PNG color type codes to human-readable names
 fn color_type_name(color_type: u8) -> &'static str {
     match color_type {
-        0 => "Y (Grayscale)",
+        0 => "Grayscale",
         2 => "RGB",
         3 => "Palette",
-        4 => "YA (Grayscale+Transparency)",
-        6 => "RGBA (RGB+Transparency)",
+        4 => "Grayscale+Alpha",
+        6 => "ARGB",
         _ => "Unknown",
     }
 }
@@ -365,7 +365,7 @@ fn main() {
                 height,
                 bit_depth,
                 color_type_name(color_type),
-                bit_depth * (match color_type {0|3=>1, 2=>3, 4=>2, 6=>4, _=>0})
+                bit_depth * (match color_type { 0 | 3 => 1, 2 => 3, 4 => 2, 6 => 4, _ => 0 })
             );
         }
 
@@ -503,6 +503,7 @@ fn main() {
         // Shared work queue index & completed trial counter across threads
         let next_trial_index = Arc::new(AtomicUsize::new(0));
         let completed_trials = Arc::new(AtomicUsize::new(0));
+
         let start_trials = Instant::now();
 
         // 3. Parallel encoding trials (Dynamic Work Stealing Queue)
@@ -578,11 +579,12 @@ fn main() {
         }
 
         let trial_duration = start_trials.elapsed();
+
         if !cli.quiet {
             if total_trials > 1 {
-                println!("\n  Trial processing took : {}", format_duration(trial_duration));
+                println!(" (time: {})", format_duration(trial_duration));
             } else {
-                println!("  Trial processing took : {}", format_duration(trial_duration));
+                println!("  Trial timing ........ : {}", format_duration(trial_duration));
             }
         }
 
@@ -601,7 +603,7 @@ fn main() {
                     );
                 }
                 println!(
-                    "  New image data size . : {} bytes ({})\n  vs original ......... : {} bytes ({})",
+                    "  New IDAT payload size : {} bytes ({})\n  vs original ......... : {} bytes ({})",
                     global_best_size,
                     format_bytes(global_best_size),
                     orig_idat_size,
@@ -618,7 +620,6 @@ fn main() {
             }
 
             if !cli.simulate {
-                let start_encode = Instant::now();
                 let original_path = PathBuf::from(file_path);
                 let out_path = if let Some(ref out_f) = cli.out_file {
                     PathBuf::from(out_f)
@@ -651,6 +652,8 @@ fn main() {
                     expected_idat_size: global_best_size, // Direct streaming mode enabled
                 };
 
+                let start_encode = Instant::now();
+
                 let enc = open_png_encode(
                     c_out_path.as_ptr(),
                     width,
@@ -678,7 +681,7 @@ fn main() {
 
                         if !cli.quiet {
                             let pct = (encoded_rows as f64 / total_rows as f64) * 100.0;
-                            print!("\r  Final encoding ...... : {:.2} percent done", pct);
+                            print!("\r  Final encoding ..... : {:.2} percent done", pct);
                             let _ = io::stdout().flush();
                         }
                     }
@@ -687,22 +690,23 @@ fn main() {
                     success = out_path.exists();
                 }
 
-                if success {
-                    let encode_duration = start_encode.elapsed();
-                    if !cli.quiet {
-                        println!("\r  Final encoding took . : {}               ", format_duration(encode_duration));
-                    }
+                let encode_duration = start_encode.elapsed();
 
+                if !cli.quiet && success {
+                    println!(" (time: {})", format_duration(encode_duration));
+                }
+
+                if success {
                     preserve_file_times(&out_path, orig_metadata.as_ref());
                     let actual_size = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
                     if !cli.quiet {
-                        println!("  Resulting file size . : {} bytes ({})", actual_size, format_bytes(actual_size as usize));
+                        println!("  Resulting file size .. : {} bytes", actual_size);
                     }
                     if is_in_place && !cli.backup {
                         let _ = fs::remove_file(&old_path);
                     }
                 } else {
-                    eprintln!("  (x) Failed to write optimal stream to {:?}", out_path);
+                    eprintln!("\n  (x) Failed to write optimal stream to {:?}", out_path);
                     if is_in_place {
                         let _ = fs::rename(&old_path, &original_path);
                     }
