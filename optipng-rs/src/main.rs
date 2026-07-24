@@ -497,12 +497,20 @@ fn main() {
             );
         }
 
+        // 3. Parallel encoding trials (Dynamic Work Stealing Queue)
         let image_data = Arc::new(raw_pixels);
         let mut handles = Vec::new();
 
-        // Shared work queue index & completed trial counter across threads
+        // Shared atomic state across worker threads
         let next_trial_index = Arc::new(AtomicUsize::new(0));
         let completed_trials = Arc::new(AtomicUsize::new(0));
+        let completed_scanlines = Arc::new(AtomicUsize::new(0));
+        let stdout_lock = Arc::new(std::sync::Mutex::new(()));
+
+        let total_rows = height as usize;
+        let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
+        let total_scanlines = total_trials * total_rows;
+
         let start_trials = Instant::now();
 
         // 3. Parallel encoding trials (Dynamic Work Stealing Queue)
@@ -511,11 +519,15 @@ fn main() {
             let img = Arc::clone(&image_data);
             let next_idx = Arc::clone(&next_trial_index);
             let completed = Arc::clone(&completed_trials);
+            let scanlines_acc = Arc::clone(&completed_scanlines);
+            let lock = Arc::clone(&stdout_lock);
             let quiet = cli.quiet;
 
             handles.push(thread::spawn(move || {
                 let mut best_size = usize::MAX;
                 let mut best_config = None;
+                // Encode in chunks (e.g. 5% increments per trial) for smooth progress updates
+                let chunk_rows = 250; //(total_rows / 20).clamp(1, 1024);
 
                 loop {
                     let idx = next_idx.fetch_add(1, Ordering::Relaxed);
@@ -546,7 +558,27 @@ fn main() {
                     );
 
                     if !enc.is_null() {
-                        encode_scanlines(enc, img.as_ptr(), height);
+                        let mut encoded_rows = 0usize;
+                        while encoded_rows < total_rows {
+                            let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
+                            let offset = encoded_rows * row_bytes;
+                            let ptr = unsafe { img.as_ptr().add(offset) };
+
+                            encode_scanlines(enc, ptr, rows_to_encode as u32);
+                            encoded_rows += rows_to_encode;
+
+                            let cur_scanlines = scanlines_acc.fetch_add(rows_to_encode, Ordering::Relaxed) + rows_to_encode;
+
+                            if !quiet && total_scanlines > 0 {
+                                let done = completed.load(Ordering::Relaxed);
+                                let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
+                                if let Ok(_guard) = lock.try_lock() {
+                                    print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
+                                    let _ = io::stdout().flush();
+                                }
+                            }
+                        }
+
                         let trial_idat_size = close_png_encode_get_idat_size(enc);
 
                         if trial_idat_size < best_size && trial_idat_size > 0 {
@@ -556,9 +588,13 @@ fn main() {
                     }
 
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if !quiet && total_trials > 1 {
-                        print!("\r  Parameter trials .... : {}/{}", done, total_trials);
-                        let _ = io::stdout().flush();
+                    if !quiet && total_scanlines > 0 {
+                        let cur_scanlines = scanlines_acc.load(Ordering::Relaxed);
+                        let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
+                        if let Ok(_guard) = lock.try_lock() {
+                            print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
+                            let _ = io::stdout().flush();
+                        }
                     }
                 }
                 (best_size, best_config)
@@ -579,11 +615,7 @@ fn main() {
 
         let trial_duration = start_trials.elapsed();
         if !cli.quiet {
-            if total_trials > 1 {
-                println!("\n  Trial processing took : {}", format_duration(trial_duration));
-            } else {
-                println!("  Trial processing took : {}", format_duration(trial_duration));
-            }
+            println!("\r  Trial process took .. : {}                       ", format_duration(trial_duration));
         }
 
         // 4. Final Output Write with atomic .png.old replacement & timestamp preservation
@@ -666,7 +698,7 @@ fn main() {
                     let total_rows = height as usize;
                     let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
                     let mut encoded_rows = 0usize;
-                    let chunk_rows = (total_rows / 100).clamp(1, 1024);
+                    let chunk_rows = 250; //(total_rows / 100).clamp(1, 1024);
 
                     while encoded_rows < total_rows {
                         let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
