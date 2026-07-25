@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+use std::cmp::Reverse;
 
 use pngstreamdec::{
     close_png, decode_scanlines, open_png, png_get_idat_size, png_set_count_idat_size,
@@ -298,6 +299,17 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Returns a relative difficulty score for zlib strategies (higher = harder to compute)
+fn zs_difficulty(zs: i32) -> u8 {
+    match zs {
+        1 => 4, // Filtered (Hardest - complex LZ77 matching)
+        0 => 3, // Default / Regular
+        2 => 2, // Huffman-only (No string matching)
+        3 => 1, // RLE (Easiest - simple run-length encoding)
+        _ => 0,
+    }
+}
+
 fn main() {
     let cli = parse_args();
 
@@ -327,6 +339,9 @@ fn main() {
             }
         }
     }
+
+    //Sort difficult ones first and easiest last
+    trials.sort_by_key(|t| Reverse((t.zc, zs_difficulty(t.zs), t.zm, t.f)));
 
     let total_trials = trials.len();
     let trials = Arc::new(trials);
