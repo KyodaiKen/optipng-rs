@@ -24,20 +24,15 @@ Designed for modern multi-core systems, `optipng-rs` achieves high compression r
 
 While `optipng-rs` matches or exceeds OptiPNG's speed and trial optimization capabilities, the following features of original OptiPNG are **currently not implemented**:
 
-1. **No Reduction to 8-Bit Indexed (Palette / `PLTE`):**
-   * *OptiPNG:* Converts Truecolor (RGB/RGBA) images containing 256 or fewer unique colors into Indexed Palette mode (`Color Type 3`).
-   * *`optipng-rs`:* **Does not** reduce Truecolor images to indexed palettes even if they have $\le 256$ colors.
-2. **All Optional Metadata is Stripped:**
+1. **All Optional Metadata is Stripped:**
    * *OptiPNG:* Preserves optional metadata chunks (e.g., `gAMA`, `pHYs`, `tIME`, `tEXt`, `zTXt`, `cHRM`) by default unless requested otherwise.
    * *`optipng-rs`:* **Strips all optional metadata chunks**. Only structural headers (`IHDR`, `IDAT`, `IEND`) are written to the output file.
-3. **No Adam7 Interlacing Support:**
+2. **No Adam7 Interlacing Support:**
    * *OptiPNG:* Can read, write, or de-interlace Adam7 PNG files (`-interlace 0/1`).
    * *`optipng-rs`:* Rejects Adam7 interlaced images during decoding.
-4. **No Truecolor to Grayscale Reduction:**
-   * *OptiPNG:* Reduces RGB/RGBA images to Grayscale (`Color Type 0` or `4`) if $R = G = B$ across all pixels.
-   * *`optipng-rs`:* Does not perform Grayscale reduction.
-5. **Missing Ancillary Utility Flags:**
+3. **Missing Ancillary Utility Flags:**
    * Advanced OptiPNG repair and snippet utilities like `-fix` (recovery of corrupt PNG files), `-force`, `-snip`, or custom chunk preservation filters are not present.
+4. **No APNG support**
 
 ---
 
