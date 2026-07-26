@@ -16,6 +16,7 @@ Designed for modern multi-core systems, `optipng-rs` achieves high compression r
   * **Alpha Channel Stripping:** Inspects alpha channels and strips alpha components if an image is 100% opaque (e.g., RGBA $\rightarrow$ RGB).
 * **Adaptive Filtering ($f=5$):** Full support for standard PNG filters (None, Sub, Up, Average, Paeth) and an adaptive heuristic using signed Sum of Absolute Differences (SAD) scoring to mirror OptiPNG heuristic outcomes.
 * **IDAT Payload Validation:** Evaluates raw IDAT compressed payloads against original source IDAT payload sizes to guarantee that files are never overwritten unless a genuine size reduction is achieved.
+* **Encode Tagra (TGA), PPM/PAM images directly to an optimized PNG** Simply add `-e myimage.tga` before the output PNG file name to encode a raw image to PNG.
 
 ---
 
@@ -77,15 +78,22 @@ optipng-rs [options] <file1.png> <file2.png> ...
 | `-nc` | | Disable color type / alpha stripping reductions. |
 | `-simulate` | | Run trials without modifying any files on disk. |
 | `-quiet` / `-silent` | | Suppress output messages. |
+| `-e` | <filename> | **NEW in 0.1.5!** Encode TGA, PPM, PGM or PAM directly to an optimized PNG! |
 
 ### Examples
 
 ```bash
 # Optimize an image with preset level 5 using 8 worker threads
-optipng-rs -o5 -mt 8 image.png
+optipng-rs -o5 -mt8 image.png
 
 # Run custom trial ranges across all filters
 optipng-rs -zc 9 -zm 8,9 -zs 0-3 -f 0-5 image.png
+
+# Encode TGA directly to an optimized PNG
+optipng-rs -o5 -e my.tga my.png
+
+# Encode PAM directly to an optimized PNG
+optipng-rs -o5 -e my.pam my.png
 ```
 
 ---
