@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::env;
 use std::ffi::{c_void, CString};
 use std::fs::{self, FileTimes, Metadata};
@@ -7,7 +8,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-use std::cmp::Reverse;
 
 use pngstreamdec::{
     close_png, decode_scanlines, open_png, png_get_idat_size, png_set_count_idat_size,
@@ -18,7 +18,7 @@ use pngstreamenc::{
 };
 
 // =========================================================================
-// OPTIPNG ENGINE
+// OPTIPNG ENGINE & STRUCTURES
 // =========================================================================
 
 #[derive(Debug, Clone)]
@@ -31,6 +31,7 @@ struct TrialConfig {
 
 struct CliArgs {
     files: Vec<String>,
+    external_input: Option<String>,
     opt_level: u8,
     mt: usize,
     zc: Option<Vec<i32>>,
@@ -43,9 +44,346 @@ struct CliArgs {
     nc: bool, // -nc flag to disable color type reduction
     out_file: Option<String>,
     out_dir: Option<String>,
+    show_help: bool,
 }
 
-/// Translates PNG color type codes to human-readable names
+struct LoadedImage {
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    color_type: u8,
+    stride: usize,
+    raw_pixels: Vec<u8>,
+    orig_idat_size: usize,
+}
+
+// =========================================================================
+// EXTERNAL FORMAT DECODERS (TGA / PPM / PGM / PAM)
+// =========================================================================
+
+/// Decodes Targa (.tga) images (Uncompressed and RLE TrueColor/Grayscale)
+fn decode_tga(data: &[u8]) -> Result<LoadedImage, String> {
+    if data.len() < 18 {
+        return Err("TGA header too short".into());
+    }
+    let id_len = data[0] as usize;
+    let color_map_type = data[1];
+    let image_type = data[2];
+    let width = u16::from_le_bytes([data[12], data[13]]) as u32;
+    let height = u16::from_le_bytes([data[14], data[15]]) as u32;
+    let bpp = data[16];
+    let descriptor = data[17];
+
+    if color_map_type != 0 {
+        return Err("Color-mapped TGA is not supported".into());
+    }
+    if width == 0 || height == 0 {
+        return Err("Invalid TGA image dimensions".into());
+    }
+
+    let is_top_down = (descriptor & 0x20) != 0;
+    let is_right_to_left = (descriptor & 0x10) != 0;
+
+    let (channels, color_type) = match bpp {
+        8 => (1, 0u8),   // Grayscale
+        24 => (3, 2u8),  // RGB
+        32 => (4, 6u8),  // RGBA
+        _ => return Err(format!("Unsupported TGA bits-per-pixel: {}", bpp)),
+    };
+
+    let mut offset = 18 + id_len;
+    let pixel_count = (width * height) as usize;
+    let mut pixels = Vec::with_capacity(pixel_count * channels);
+
+    if image_type == 2 || image_type == 3 {
+        // Uncompressed TrueColor or Grayscale
+        let required = offset + pixel_count * channels;
+        if data.len() < required {
+            return Err("Truncated TGA pixel data".into());
+        }
+        let raw = &data[offset..required];
+        for chunk in raw.chunks_exact(channels) {
+            if channels >= 3 {
+                pixels.push(chunk[2]); // Convert BGR(A) -> RGB(A)
+                pixels.push(chunk[1]);
+                pixels.push(chunk[0]);
+                if channels == 4 {
+                    pixels.push(chunk[3]);
+                }
+            } else {
+                pixels.extend_from_slice(chunk);
+            }
+        }
+    } else if image_type == 10 || image_type == 11 {
+        // RLE Compressed TrueColor or Grayscale
+        while pixels.len() < pixel_count * channels && offset < data.len() {
+            let packet_header = data[offset];
+            offset += 1;
+            let count = ((packet_header & 0x7F) as usize) + 1;
+            let is_rle = (packet_header & 0x80) != 0;
+
+            if is_rle {
+                if offset + channels > data.len() {
+                    return Err("Unexpected EOF in TGA RLE stream".into());
+                }
+                let pixel = &data[offset..offset + channels];
+                offset += channels;
+                for _ in 0..count {
+                    if channels >= 3 {
+                        pixels.push(pixel[2]);
+                        pixels.push(pixel[1]);
+                        pixels.push(pixel[0]);
+                        if channels == 4 {
+                            pixels.push(pixel[3]);
+                        }
+                    } else {
+                        pixels.extend_from_slice(pixel);
+                    }
+                }
+            } else {
+                let bytes_needed = count * channels;
+                if offset + bytes_needed > data.len() {
+                    return Err("Unexpected EOF in TGA raw stream".into());
+                }
+                let raw = &data[offset..offset + bytes_needed];
+                offset += bytes_needed;
+                for chunk in raw.chunks_exact(channels) {
+                    if channels >= 3 {
+                        pixels.push(chunk[2]);
+                        pixels.push(chunk[1]);
+                        pixels.push(chunk[0]);
+                        if channels == 4 {
+                            pixels.push(chunk[3]);
+                        }
+                    } else {
+                        pixels.extend_from_slice(chunk);
+                    }
+                }
+            }
+        }
+    } else {
+        return Err(format!("Unsupported TGA image type code: {}", image_type));
+    }
+
+    // Orient image scanlines correctly (Default TGA is bottom-up)
+    let row_bytes = width as usize * channels;
+    let mut final_pixels = vec![0u8; pixels.len()];
+
+    for y in 0..height as usize {
+        let src_y = if is_top_down { y } else { (height as usize - 1) - y };
+        let src_start = src_y * row_bytes;
+        let dst_start = y * row_bytes;
+
+        if is_right_to_left {
+            for x in 0..width as usize {
+                let src_x = (width as usize - 1) - x;
+                let src_px = src_start + src_x * channels;
+                let dst_px = dst_start + x * channels;
+                final_pixels[dst_px..dst_px + channels].copy_from_slice(&pixels[src_px..src_px + channels]);
+            }
+        } else {
+            final_pixels[dst_start..dst_start + row_bytes].copy_from_slice(&pixels[src_start..src_start + row_bytes]);
+        }
+    }
+
+    Ok(LoadedImage {
+        width,
+        height,
+        bit_depth: 8,
+        color_type,
+        stride: row_bytes,
+        raw_pixels: final_pixels,
+        orig_idat_size: data.len(),
+    })
+}
+
+/// Decodes Netpbm images (.ppm, .pgm, .pam)
+fn decode_netpbm(data: &[u8]) -> Result<LoadedImage, String> {
+    let mut pos = 0;
+
+    let read_line = |pos: &mut usize| -> Result<String, String> {
+        let start = *pos;
+        while *pos < data.len() && data[*pos] != b'\n' {
+            *pos += 1;
+        }
+        if *pos >= data.len() {
+            return Err("Unexpected EOF reading header".into());
+        }
+        let line_bytes = &data[start..*pos];
+        *pos += 1;
+        std::str::from_utf8(line_bytes)
+        .map(|s| s.trim().to_string())
+        .map_err(|e| e.to_string())
+    };
+
+    let magic = read_line(&mut pos)?;
+
+    if magic == "P7" {
+        // PAM Format
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut depth = 0u32;
+        let mut maxval = 0u32;
+        let mut tupltype = String::new();
+
+        loop {
+            let line = read_line(&mut pos)?;
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            if line == "ENDHDR" {
+                break;
+            }
+            if let Some((key, val)) = line.split_once(' ') {
+                let val_trimmed = val.trim();
+                match key.trim() {
+                    "WIDTH" => width = val_trimmed.parse().unwrap_or(0),
+                    "HEIGHT" => height = val_trimmed.parse().unwrap_or(0),
+                    "DEPTH" => depth = val_trimmed.parse().unwrap_or(0),
+                    "MAXVAL" => maxval = val_trimmed.parse().unwrap_or(0),
+                    "TUPLTYPE" => tupltype = val_trimmed.to_string(),
+                    _ => {}
+                }
+            }
+        }
+
+        if width == 0 || height == 0 || depth == 0 || maxval == 0 {
+            return Err("Invalid PAM header configuration".into());
+        }
+
+        let color_type = match (depth, tupltype.as_str()) {
+            (1, _) => 0u8, // Grayscale
+            (2, _) => 4u8, // Gray + Alpha
+            (3, _) => 2u8, // RGB
+            (4, _) => 6u8, // RGBA
+            _ => match depth {
+                1 => 0, 2 => 4, 3 => 2, 4 => 6,
+                _ => return Err(format!("Unsupported PAM depth: {}", depth)),
+            },
+        };
+
+        let bit_depth = if maxval <= 255 { 8 } else if maxval <= 65535 { 16 } else { return Err("Unsupported PAM maxval".into()); };
+        let bytes_per_sample = if bit_depth == 8 { 1 } else { 2 };
+        let stride = width as usize * depth as usize * bytes_per_sample;
+        let expected_bytes = height as usize * stride;
+
+        if data.len() - pos < expected_bytes {
+            return Err("PAM pixel data truncated".into());
+        }
+
+        let raw_pixels = data[pos..pos + expected_bytes].to_vec();
+
+        Ok(LoadedImage {
+            width,
+            height,
+            bit_depth,
+            color_type,
+            stride,
+            raw_pixels,
+            orig_idat_size: data.len(),
+        })
+    } else if magic == "P5" || magic == "P6" {
+        // P5 = Binary PGM, P6 = Binary PPM
+        let is_rgb = magic == "P6";
+        let mut header_tokens = Vec::new();
+
+        while header_tokens.len() < 3 && pos < data.len() {
+            while pos < data.len() && data[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if pos < data.len() && data[pos] == b'#' {
+                while pos < data.len() && data[pos] != b'\n' {
+                    pos += 1;
+                }
+                continue;
+            }
+            let tok_start = pos;
+            while pos < data.len() && !data[pos].is_ascii_whitespace() {
+                pos += 1;
+            }
+            if tok_start < pos {
+                if let Ok(tok) = std::str::from_utf8(&data[tok_start..pos]) {
+                    header_tokens.push(tok.to_string());
+                }
+            }
+        }
+
+        if header_tokens.len() < 3 {
+            return Err("Invalid PPM/PGM header structure".into());
+        }
+
+        if pos < data.len() && data[pos].is_ascii_whitespace() {
+            pos += 1;
+        }
+
+        let width: u32 = header_tokens[0].parse().map_err(|_| "Invalid width")?;
+        let height: u32 = header_tokens[1].parse().map_err(|_| "Invalid height")?;
+        let maxval: u32 = header_tokens[2].parse().map_err(|_| "Invalid maxval")?;
+
+        let color_type = if is_rgb { 2u8 } else { 0u8 };
+        let channels = if is_rgb { 3 } else { 1 };
+        let bit_depth = if maxval <= 255 { 8 } else { 16 };
+        let bytes_per_sample = if bit_depth == 8 { 1 } else { 2 };
+        let stride = width as usize * channels * bytes_per_sample;
+        let expected_bytes = height as usize * stride;
+
+        if data.len() - pos < expected_bytes {
+            return Err("PPM/PGM pixel data truncated".into());
+        }
+
+        let raw_pixels = data[pos..pos + expected_bytes].to_vec();
+
+        Ok(LoadedImage {
+            width,
+            height,
+            bit_depth,
+            color_type,
+            stride,
+            raw_pixels,
+            orig_idat_size: data.len(),
+        })
+    } else {
+        Err("Unsupported Netpbm magic format".into())
+    }
+}
+
+/// Dispatches image loading based on file headers / extensions
+fn load_external_image(file_path: &str) -> Result<LoadedImage, String> {
+    let data = fs::read(file_path).map_err(|e| format!("Failed to read file {:?}: {}", file_path, e))?;
+
+    if data.starts_with(b"P5") || data.starts_with(b"P6") || data.starts_with(b"P7") {
+        decode_netpbm(&data)
+    } else {
+        decode_tga(&data)
+    }
+}
+
+// =========================================================================
+// HELPER FUNCTIONS & CLI PARSER
+// =========================================================================
+
+fn print_usage() {
+    println!("optipng-rs: High-performance parallel PNG optimizer and converter\n");
+    println!("USAGE:");
+    println!("  optipng-rs [options] <file1.png> [file2.png ...]");
+    println!("  optipng-rs [options] -e <input_file> [output.png]\n");
+    println!("OPTIONS:");
+    println!("  -o <level>         Optimization level 0-7 (default: 2)");
+    println!("  -mt <threads>      Number of worker threads (default: 75% of CPUs)");
+    println!("  -e <file>          External input file format (TGA, PPM, PGM, PAM) to encode");
+    println!("  -out <file>        Output file path");
+    println!("  -dir <directory>   Output directory");
+    println!("  -zc <levels>       zlib compression levels (e.g. -zc1-9 or -zc9)");
+    println!("  -zm <levels>       zlib memory levels (e.g. -zm1-9 or -zm8,9)");
+    println!("  -zs <strategies>   zlib compression strategies (e.g. -zs0-3)");
+    println!("  -f <filters>       PNG delta filter algorithms (e.g. -f0,5 or -f0-5)");
+    println!("  -nc                Disable color type & transparency reduction");
+    println!("  -backup, -keep     Keep backup copy of original file (.bak)");
+    println!("  -simulate          Simulation mode (trials only, no file writes)");
+    println!("  -quiet, -silent    Quiet mode");
+    println!("  -h, --help         Print this help message\n");
+}
+
 fn color_type_name(color_type: u8) -> &'static str {
     match color_type {
         0 => "Y (Grayscale)",
@@ -57,7 +395,6 @@ fn color_type_name(color_type: u8) -> &'static str {
     }
 }
 
-/// Zero-allocation stream callback. Discards bytes and only counts the size.
 unsafe extern "C" fn counter_write_cb(user_data: *mut c_void, _buf: *const u8, len: usize) -> usize {
     if !user_data.is_null() && !_buf.is_null() {
         let counter = unsafe { &mut *(user_data as *mut usize) };
@@ -66,7 +403,6 @@ unsafe extern "C" fn counter_write_cb(user_data: *mut c_void, _buf: *const u8, l
     len
 }
 
-/// Helper function to copy file modification and access times across all platforms supported by Rust
 fn preserve_file_times(target_path: &Path, orig_metadata: Option<&Metadata>) {
     if let Some(meta) = orig_metadata {
         let mut times = FileTimes::new();
@@ -89,7 +425,6 @@ fn preserve_file_times(target_path: &Path, orig_metadata: Option<&Metadata>) {
     }
 }
 
-/// Parses combinatorial strings like "0-3" or "0,5" into a flat i32 vector
 fn parse_ranges_i32(input: &str) -> Vec<i32> {
     let mut result = Vec::new();
     for part in input.split(',') {
@@ -106,15 +441,13 @@ fn parse_ranges_i32(input: &str) -> Vec<i32> {
     result
 }
 
-/// Helper wrapper to parse u8 ranges safely
 fn parse_ranges_u8(input: &str) -> Vec<u8> {
     parse_ranges_i32(input)
-        .into_iter()
-        .filter_map(|v| u8::try_from(v).ok())
-        .collect()
+    .into_iter()
+    .filter_map(|v| u8::try_from(v).ok())
+    .collect()
 }
 
-/// Resolves OptiPNG heuristic combinations based on optimization level
 fn get_opt_combinations(level: u8) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<u8>) {
     match level {
         0 | 1 => (vec![9], vec![8], vec![0], vec![0]),
@@ -132,6 +465,7 @@ fn parse_args() -> CliArgs {
     let mut args = env::args().skip(1);
     let mut cli = CliArgs {
         files: Vec::new(),
+        external_input: None,
         opt_level: 2,
         mt: 0,
         zc: None,
@@ -144,9 +478,26 @@ fn parse_args() -> CliArgs {
         nc: false,
         out_file: None,
         out_dir: None,
+        show_help: false,
     };
 
     while let Some(arg) = args.next() {
+        if arg == "-h" || arg == "--help" {
+            cli.show_help = true;
+            return cli;
+        }
+
+        if arg == "-e" {
+            if let Some(val) = args.next() {
+                cli.external_input = Some(val);
+            } else {
+                eprintln!("Error: Option -e requires an input file argument.");
+                cli.show_help = true;
+                return cli;
+            }
+            continue;
+        }
+
         if arg.starts_with("-o") && arg.len() > 2 && arg[2..].chars().all(|c| c.is_ascii_digit()) {
             let level: u8 = arg[2..].parse().unwrap_or(2);
             cli.opt_level = level.min(7);
@@ -159,11 +510,7 @@ fn parse_args() -> CliArgs {
         }
 
         if arg.starts_with("-zc") {
-            let val_str = if arg.len() > 3 {
-                Some(arg[3..].to_string())
-            } else {
-                args.next()
-            };
+            let val_str = if arg.len() > 3 { Some(arg[3..].to_string()) } else { args.next() };
             if let Some(v) = val_str {
                 let mut parsed = parse_ranges_i32(&v);
                 cli.zc.get_or_insert_with(Vec::new).append(&mut parsed);
@@ -172,11 +519,7 @@ fn parse_args() -> CliArgs {
         }
 
         if arg.starts_with("-zm") {
-            let val_str = if arg.len() > 3 {
-                Some(arg[3..].to_string())
-            } else {
-                args.next()
-            };
+            let val_str = if arg.len() > 3 { Some(arg[3..].to_string()) } else { args.next() };
             if let Some(v) = val_str {
                 let mut parsed = parse_ranges_i32(&v);
                 cli.zm.get_or_insert_with(Vec::new).append(&mut parsed);
@@ -185,11 +528,7 @@ fn parse_args() -> CliArgs {
         }
 
         if arg.starts_with("-zs") {
-            let val_str = if arg.len() > 3 {
-                Some(arg[3..].to_string())
-            } else {
-                args.next()
-            };
+            let val_str = if arg.len() > 3 { Some(arg[3..].to_string()) } else { args.next() };
             if let Some(v) = val_str {
                 let mut parsed = parse_ranges_i32(&v);
                 cli.zs.get_or_insert_with(Vec::new).append(&mut parsed);
@@ -198,11 +537,7 @@ fn parse_args() -> CliArgs {
         }
 
         if arg.starts_with("-f") {
-            let val_str = if arg.len() > 2 {
-                Some(arg[2..].to_string())
-            } else {
-                args.next()
-            };
+            let val_str = if arg.len() > 2 { Some(arg[2..].to_string()) } else { args.next() };
             if let Some(v) = val_str {
                 let mut parsed = parse_ranges_u8(&v);
                 cli.f.get_or_insert_with(Vec::new).append(&mut parsed);
@@ -240,13 +575,11 @@ fn parse_args() -> CliArgs {
         }
     }
 
-    // Deduplicate custom parameter lists if provided
     if let Some(ref mut list) = cli.zc { list.sort_unstable(); list.dedup(); }
     if let Some(ref mut list) = cli.zm { list.sort_unstable(); list.dedup(); }
     if let Some(ref mut list) = cli.zs { list.sort_unstable(); list.dedup(); }
     if let Some(ref mut list) = cli.f  { list.sort_unstable(); list.dedup(); }
 
-    // Default to 75% of available system threads
     if cli.mt == 0 {
         let available = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         cli.mt = ((available * 3) / 4).max(1);
@@ -256,18 +589,12 @@ fn parse_args() -> CliArgs {
 
 fn format_bytes(bytes: usize) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
-
     if bytes == 0 {
         return "0 B".to_string();
     }
-
     let base = 1024f64;
     let bytes_f = bytes as f64;
-
-    // Determine the appropriate unit index (logarithmic scale base 1024)
     let digit = (bytes_f.log(base)).floor() as usize;
-
-    // Clamp the index in case the value exceeds YB
     let digit = digit.min(UNITS.len() - 1);
 
     if digit == 0 {
@@ -278,7 +605,6 @@ fn format_bytes(bytes: usize) -> String {
     }
 }
 
-/// Formats duration into `days:HH:MM:SS.fff`, omitting `days:` and `HH:` when zero.
 fn format_duration(duration: Duration) -> String {
     let total_millis = duration.as_millis();
     let millis = (total_millis % 1000) as u64;
@@ -299,23 +625,32 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// Returns a relative difficulty score for zlib strategies (higher = harder to compute)
 fn zs_difficulty(zs: i32) -> u8 {
     match zs {
-        1 => 4, // Filtered (Hardest - complex LZ77 matching)
-        0 => 3, // Default / Regular
-        2 => 2, // Huffman-only (No string matching)
-        3 => 1, // RLE (Easiest - simple run-length encoding)
+        1 => 4, // Filtered (Hardest)
+        0 => 3, // Default
+        2 => 2, // Huffman-only
+        3 => 1, // RLE (Easiest)
         _ => 0,
     }
 }
 
+// =========================================================================
+// MAIN PROCESSING LOOP
+// =========================================================================
+
 fn main() {
     let cli = parse_args();
 
-    if cli.files.is_empty() {
+    if cli.show_help {
+        print_usage();
+        std::process::exit(0);
+    }
+
+    if cli.files.is_empty() && cli.external_input.is_none() {
         if !cli.quiet {
-            eprintln!("optipng-rs: No input files provided.");
+            eprintln!("optipng-rs: Error: No input files specified.\n");
+            print_usage();
         }
         std::process::exit(1);
     }
@@ -340,37 +675,94 @@ fn main() {
         }
     }
 
-    //Sort difficult ones first and easiest last
+    // Sort difficult trials first (LPT Scheduling)
     trials.sort_by_key(|t| Reverse((t.zc, zs_difficulty(t.zs), t.zm, t.f)));
 
     let total_trials = trials.len();
     let trials = Arc::new(trials);
 
-    for file_path in &cli.files {
+    // Prepare list of file target tasks: (Input path, Output path, is_external)
+    let mut tasks: Vec<(String, String, bool)> = Vec::new();
+
+    if let Some(ext_in) = cli.external_input {
+        let out_path = if let Some(ref out_f) = cli.out_file {
+            out_f.clone()
+        } else if !cli.files.is_empty() {
+            cli.files[0].clone()
+        } else {
+            let p = PathBuf::from(&ext_in);
+            p.with_extension("png").to_string_lossy().to_string()
+        };
+        tasks.push((ext_in, out_path, true));
+    } else {
+        for f in &cli.files {
+            tasks.push((f.clone(), f.clone(), false));
+        }
+    }
+
+    for (file_path, target_out_path, is_external) in tasks {
         if !cli.quiet {
             println!("Processing: {} ({} trials, with {} parallel threads)", file_path, total_trials, cli.mt);
         }
 
-        let c_file = CString::new(file_path.clone()).unwrap();
-        let mut width = 0;
-        let mut height = 0;
-        let mut bit_depth = 0;
-        let mut color_type = 0;
-        let mut stride = 0;
+        let mut width: u32 = 0;
+        let mut height: u32 = 0;
+        let mut bit_depth: u8 = 0;
+        let mut color_type: u8 = 0;
+        let mut stride: usize = 0;
+        let mut raw_pixels: Vec<u8>;
+        let orig_idat_size: usize;
 
-        // 1. Load image and metadata via decoder API
-        let dec = open_png(
-            c_file.as_ptr(),
-            &mut width,
-            &mut height,
-            &mut bit_depth,
-            &mut color_type,
-            &mut stride,
-        );
+        // 1. Decode Image Input (External TGA/PNM or PNG FFI)
+        if is_external {
+            match load_external_image(&file_path) {
+                Ok(img) => {
+                    width = img.width;
+                    height = img.height;
+                    bit_depth = img.bit_depth;
+                    color_type = img.color_type;
+                    stride = img.stride;
+                    raw_pixels = img.raw_pixels;
+                    orig_idat_size = img.orig_idat_size;
+                }
+                Err(err_msg) => {
+                    eprintln!("  (x) External format decoding error: {}", err_msg);
+                    continue;
+                }
+            }
+        } else {
+            let c_file = CString::new(file_path.clone()).unwrap();
+            let mut stride_usize = 0;
 
-        if dec.is_null() {
-            eprintln!("  (x) Failed to decode {}", file_path);
-            continue;
+            let dec = open_png(
+                c_file.as_ptr(),
+                               &mut width,
+                               &mut height,
+                               &mut bit_depth,
+                               &mut color_type,
+                               &mut stride_usize,
+            );
+
+            if dec.is_null() {
+                eprintln!("  (x) Failed to decode PNG {}", file_path);
+                continue;
+            }
+
+            png_set_count_idat_size(dec, true);
+
+            let expected_size = stride * height as usize;
+            raw_pixels = Vec::with_capacity(expected_size);
+
+            loop {
+                let res = decode_scanlines(dec, 1024);
+                if res.size == 0 || res.data.is_null() {
+                    break;
+                }
+                let chunk = unsafe { std::slice::from_raw_parts(res.data, res.size) };
+                raw_pixels.extend_from_slice(chunk);
+            }
+            orig_idat_size = png_get_idat_size(dec);
+            close_png(dec);
         }
 
         if !cli.quiet {
@@ -380,36 +772,17 @@ fn main() {
                 height,
                 bit_depth,
                 color_type_name(color_type),
-                bit_depth * (match color_type {0|3=>1, 2=>3, 4=>2, 6=>4, _=>0})
+                bit_depth * (match color_type { 0 | 3 => 1, 2 => 3, 4 => 2, 6 => 4, _ => 0 })
             );
         }
-
-        // Enable IDAT size tracking on decoder
-        png_set_count_idat_size(dec, true);
 
         let mut out_color_type = color_type;
         let mut out_bit_depth = bit_depth;
 
-        // For paletted images
         if color_type == 3 {
             out_bit_depth = 8;
             out_color_type = if stride == (width as usize * 4) { 6 } else { 2 };
         }
-
-        // PRE-ALLOCATE EXACT CAPACITY
-        let expected_size = stride as usize * height as usize;
-        let mut raw_pixels = Vec::with_capacity(expected_size);
-
-        loop {
-            let res = decode_scanlines(dec, 1024);
-            if res.size == 0 || res.data.is_null() {
-                break;
-            }
-            let chunk = unsafe { std::slice::from_raw_parts(res.data, res.size) };
-            raw_pixels.extend_from_slice(chunk);
-        }
-        let orig_idat_size = png_get_idat_size(dec);
-        close_png(dec);
 
         // 2a. Bit depth reduction (Fake 16-bit to 8-bit)
         if out_bit_depth == 16 {
@@ -496,8 +869,8 @@ fn main() {
                     if !cli.quiet {
                         println!(
                             "  (i) Reducing color type from {} to {} (all pixels are 100% opaque)",
-                            color_type_name(old_color_type),
-                            color_type_name(out_color_type)
+                                 color_type_name(old_color_type),
+                                 color_type_name(out_color_type)
                         );
                     }
                 }
@@ -506,9 +879,9 @@ fn main() {
 
         if !cli.quiet {
             println!(
-                "  PNG loaded .......... : {} bytes ({}) in memory. Starting trials...",
-                raw_pixels.len(),
-                format_bytes(raw_pixels.len())
+                "  Image loaded ........ : {} bytes ({}) in memory. Starting trials...",
+                     raw_pixels.len(),
+                     format_bytes(raw_pixels.len())
             );
         }
 
@@ -516,7 +889,6 @@ fn main() {
         let image_data = Arc::new(raw_pixels);
         let mut handles = Vec::new();
 
-        // Shared atomic state across worker threads
         let next_trial_index = Arc::new(AtomicUsize::new(0));
         let completed_trials = Arc::new(AtomicUsize::new(0));
         let completed_scanlines = Arc::new(AtomicUsize::new(0));
@@ -528,7 +900,6 @@ fn main() {
 
         let start_trials = Instant::now();
 
-        // 3. Parallel encoding trials (Dynamic Work Stealing Queue)
         for _ in 0..cli.mt {
             let trials_clone = Arc::clone(&trials);
             let img = Arc::clone(&image_data);
@@ -541,8 +912,7 @@ fn main() {
             handles.push(thread::spawn(move || {
                 let mut best_size = usize::MAX;
                 let mut best_config = None;
-                // Encode in chunks (e.g. 5% increments per trial) for smooth progress updates
-                let chunk_rows = 250; //(total_rows / 20).clamp(1, 1024);
+                let chunk_rows = 250;
 
                 loop {
                     let idx = next_idx.fetch_add(1, Ordering::Relaxed);
@@ -558,7 +928,7 @@ fn main() {
                         window_bits: 15,
                         mem_level: trial.zm,
                         max_idat_size: 32768,
-                        expected_idat_size: 0, // Trial pass
+                        expected_idat_size: 0,
                     };
 
                     let enc = open_png_encode_stream(
@@ -633,7 +1003,7 @@ fn main() {
             println!("\r  Trial process took .. : {}                       ", format_duration(trial_duration));
         }
 
-        // 4. Final Output Write with atomic .png.old replacement & timestamp preservation
+        // 4. Final Output Write
         if let Some(best) = global_best_config {
             if !cli.quiet {
                 if total_trials > 1 {
@@ -656,8 +1026,8 @@ fn main() {
                 );
             }
 
-            // SKIP FILE MODIFICATION IF TRIAL RESULT IS SAME OR LARGER
-            if global_best_size >= orig_idat_size {
+            // For existing PNGs, skip file modification if trial result is larger
+            if !is_external && global_best_size >= orig_idat_size {
                 if !cli.quiet {
                     println!("  /!\\ No compression improvement over source IDAT size. Skipping file write.");
                 }
@@ -666,15 +1036,15 @@ fn main() {
 
             if !cli.simulate {
                 let start_encode = Instant::now();
-                let original_path = PathBuf::from(file_path);
+                let original_path = PathBuf::from(&file_path);
                 let out_path = if let Some(ref out_f) = cli.out_file {
                     PathBuf::from(out_f)
                 } else if let Some(ref out_d) = cli.out_dir {
                     let mut pb = PathBuf::from(out_d);
-                    pb.push(original_path.file_name().unwrap());
+                    pb.push(PathBuf::from(&target_out_path).file_name().unwrap());
                     pb
                 } else {
-                    original_path.clone()
+                    PathBuf::from(&target_out_path)
                 };
 
                 let orig_metadata = fs::metadata(&original_path).ok();
@@ -713,7 +1083,7 @@ fn main() {
                     let total_rows = height as usize;
                     let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
                     let mut encoded_rows = 0usize;
-                    let chunk_rows = 250; //(total_rows / 100).clamp(1, 1024);
+                    let chunk_rows = 250;
 
                     while encoded_rows < total_rows {
                         let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
