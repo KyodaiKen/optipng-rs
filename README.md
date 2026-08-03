@@ -1,8 +1,8 @@
 # optipng-rs
 
-A high-performance, multi-threaded Rust reimplementation of **OptiPNG**, optimized for modern multi-core systems, SFF hardware, and large-scale media library management.
+A high-performance, multi-threaded Rust reimplementation of **OptiPNG**, optimized for modern multi-core systems.
 
-`optipng-rs` achieves high compression ratios using combinatorial parameter searching, zero-allocation zlib streaming, adaptive filter optimization, and smart bit-depth/alpha channel reduction. It also features a zero-CPU fast path for fast IDAT chunk coalescing and deduplication-friendly metadata injection.
+`optipng-rs` achieves high compression ratios using combinatorial parameter searching, zero-allocation zlib streaming, adaptive filter optimization, and smart bit-depth/alpha channel reduction. It also features a fast path for fast IDAT chunk coalescing and deduplication-friendly metadata injection.
 
 ---
 
@@ -10,9 +10,8 @@ A high-performance, multi-threaded Rust reimplementation of **OptiPNG**, optimiz
 
 * **True Multi-Threaded Work-Stealing:** Utilizes dynamic work-stealing queues (`AtomicUsize`) across trial permutations, ensuring **100% CPU core utilization** across threads even when individual trial durations vary wildly.
 * **Zero-Recompression Fast Path (`-o0` / `-nz`):** Bypasses trial search and pixel re-encoding entirely. Reads raw IDAT streams and merges them into single coalesced chunks (up to 2GB boundaries) without decompressing pixel data or loading uncompressed frames into RAM.
-* **Deduplication-Friendly Metadata Injection:** Strips non-essential metadata and injects an uncompressed `tEXt` chunk with the key `optipng-rs` to track optimization state. Because the underlying raw `IDAT` payload remains untouched during fast-path operations, Content-Defined Chunking (CDC) backup systems (such as Borg Backup) maintain near-100% deduplication efficiency.
+* **Metadata Injection:** Strips non-essential metadata and injects a `tEXt` chunk with the key `optipng-rs` to track optimization state.
 * **Direct IDAT Streaming:** Computes expected zlib compression sizes during trial passes and streams winning compressed data directly into the PNG container in a single pass without holding large compressed chunks in memory.
-* **Zero-Wear File Swapping:** Performs atomic metadata pointer swaps (`fs::rename`) on file replacement, preventing unnecessary disk re-writes, reducing SSD wear, and providing instant replacements regardless of file size.
 * **Lossless Color & Bit Depth Reductions:**
   * **Fake 16-Bit Detection:** Automatically identifies 16-bit-per-channel images where MSB == LSB (bit duplication) and losslessly converts them to 8-bit.
   * **Alpha Channel Stripping:** Inspects alpha channels and strips alpha components if an image is 100% opaque (e.g., RGBA -> RGB).
@@ -20,7 +19,6 @@ A high-performance, multi-threaded Rust reimplementation of **OptiPNG**, optimiz
 * **Adaptive Filtering (f=5):** Full support for standard PNG filters (None, Sub, Up, Average, Paeth) and an adaptive heuristic using signed Sum of Absolute Differences (SAD) scoring to mirror OptiPNG heuristic outcomes.
 * **IDAT Payload Validation:** Evaluates raw IDAT compressed payloads against original source payload sizes to guarantee files are never overwritten unless a genuine size reduction is achieved (unless `-force` is specified).
 * **Direct Image Format Encoding:** Encodes Targa (TGA), PPM, PGM, and PAM images directly into optimized PNGs via the `-e` flag.
-* **C-FFI Bindings:** Includes exported C-compatible FFI interface for custom chunk copying and multi-chunk metadata injection.
 
 ---
 
@@ -46,7 +44,7 @@ Ensure you have a modern Rust toolchain installed.
 
 ```bash
 # Clone the repository
-git clone [https://github.com/KyodaiKen/optipng-rs.git](https://github.com/KyodaiKen/optipng-rs.git)
+git clone https://github.com/KyodaiKen/optipng-rs.git
 cd optipng-rs
 
 # Build release binary
