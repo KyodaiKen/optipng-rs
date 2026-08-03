@@ -1021,6 +1021,10 @@ fn main() {
     }
 
     for (file_path, target_out_path, is_external) in tasks {
+        if !cli.quiet {
+            println!("Processing: {}", file_path);
+        }
+
         let mut width: u32 = 0;
         let mut height: u32 = 0;
         let mut bit_depth: u8 = 0;
@@ -1412,7 +1416,7 @@ fn main() {
 
         if !cli.quiet {
             println!(
-                "  Image loaded ........ : {} bytes ({}) in memory. Starting trials...",
+                "  Image loaded ........ : {} bytes ({}) in memory.",
                      raw_pixels.len(),
                      format_bytes(raw_pixels.len())
             );
@@ -1465,7 +1469,7 @@ fn main() {
             let trials = Arc::new(trials);
 
             if !cli.quiet {
-                println!("Processing: {} ({} trials, with {} parallel threads)", file_path, total_trials, cli.mt);
+                println!("  Starting Trials ..... : {} trials, with {} parallel threads", total_trials, cli.mt);
             }
 
             // 3. Parallel encoding trials (Dynamic Work Stealing Queue)
