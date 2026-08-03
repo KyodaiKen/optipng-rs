@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use pngstreamdec::{
     close_png, decode_scanlines, open_png, png_get_idat_size, png_set_count_idat_size,
-    png_get_text_count, png_get_text_data,
+    png_get_text_count, png_get_text_data, free_text_data
 };
 use pngstreamenc::{
     close_png_encode, close_png_encode_get_idat_size, encode_scanlines, open_png_encode,
@@ -911,12 +911,12 @@ fn parse_args() -> CliArgs {
                 i += 1;
             }
         }
+    }
 
-        // Implement level 0
-        if cli.opt_level == 0 {
-            cli.nx = true;
-            cli.nz = true;
-        }
+    // Implement level 0
+    if cli.opt_level == 0 {
+        cli.nx = true;
+        cli.nz = true;
     }
 
     cli.cmd_options = opt_tokens.join(" ");
@@ -1082,8 +1082,14 @@ fn main() {
                             let keyword = unsafe { CStr::from_ptr(kw_ptr) }.to_str().unwrap_or("");
                             if keyword == "optipng-rs" {
                                 already_optimized = true;
-                                break;
                             }
+                        }
+
+                        // Free both CString allocations using lib.rs's internal allocator
+                        free_text_data(kw_ptr as *mut _, txt_ptr as *mut _);
+
+                        if already_optimized {
+                            break;
                         }
                     }
                 }
@@ -1123,7 +1129,7 @@ fn main() {
             }
         }
 
-        if !cli.quiet {
+        if !cli.quiet && !cli.nz {
             println!(
                 "  Input Image ......... : {} x {} / {} bpc / {} / {} bpp",
                 width,
@@ -1304,7 +1310,7 @@ fn main() {
                     }
                 }
 
-                // 2d. Reduction to 8-Bit Indexed / Palette (Unique Colors <= 256)
+                // 2d. Reduction to Indexed / Palette (Unique Colors <= 256, down to 1, 2, or 4-bit)
                 if !cli.np && out_bit_depth == 8 && (out_color_type == 2 || out_color_type == 6) {
                     use std::collections::{HashMap, HashSet};
 
@@ -1345,7 +1351,6 @@ fn main() {
                             // 2. Sort palette to optimize for DEFLATE + tRNS chunk trimming:
                             // - Non-opaque colors (a < 255) are moved to the front sorted by alpha.
                             // - Opaque colors (a == 255) maintain Scanline First-Appearance order.
-                            // (Rust's `sort_by_key` is a STABLE sort, preserving original order for equal keys).
                             unique_colors.sort_by_key(|px| {
                                 let (_, _, _, a) = extract_rgba(px);
                                 (a == 255, a)
@@ -1368,7 +1373,7 @@ fn main() {
                                 }
                             }
 
-                            // 4. Re-index image pixel data to sorted palette indices
+                            // 4. Re-index image pixel data to sorted 8-bit palette indices
                             let num_pixels = raw_pixels.len() / px_bytes;
                             for i in 0..num_pixels {
                                 let px_start = i * px_bytes;
@@ -1376,9 +1381,53 @@ fn main() {
                                 raw_pixels[i] = idx;
                             }
                             raw_pixels.truncate(num_pixels);
+
+                            // 5. Determine optimal sub-8-bit depth (1, 2, 4, or 8 bits)
+                            let target_bit_depth: u8 = match unique_colors.len() {
+                                0..=2 => 1,
+                                3..=4 => 2,
+                                5..=16 => 4,
+                                _ => 8,
+                            };
+
+                            // 6. Pack sub-byte pixels row-by-row if bit depth < 8
+                            if target_bit_depth < 8 {
+                                out_bit_depth = target_bit_depth;
+                                let w = width as usize;
+                                let h = height as usize;
+                                let mut packed_pixels = Vec::with_capacity(h * ((w * (target_bit_depth as usize) + 7) / 8));
+
+                                for r in 0..h {
+                                    let row_start = r * w;
+                                    let row_end = (row_start + w).min(num_pixels);
+                                    let row_pixels = &raw_pixels[row_start..row_end];
+
+                                    let mut current_byte = 0u8;
+                                    let mut bit_pos = 0; // Filled bits in current byte
+
+                                    for &idx in row_pixels {
+                                        let shift = 8 - bit_pos - target_bit_depth;
+                                        current_byte |= (idx & ((1 << target_bit_depth) - 1)) << shift;
+                                        bit_pos += target_bit_depth;
+
+                                        if bit_pos == 8 {
+                                            packed_pixels.push(current_byte);
+                                            current_byte = 0;
+                                            bit_pos = 0;
+                                        }
+                                    }
+
+                                    // Pad trailing partial byte for current scanline
+                                    if bit_pos > 0 {
+                                        packed_pixels.push(current_byte);
+                                    }
+                                }
+                                raw_pixels = packed_pixels;
+                            }
+
                             raw_pixels.shrink_to_fit();
 
-                            // 5. Trim trailing 255 alpha values from tRNS chunk per PNG spec
+                            // 7. Trim trailing 255 alpha values from tRNS chunk per PNG spec
                             if !has_trns {
                                 palette_trns.clear();
                             } else {
@@ -1398,9 +1447,10 @@ fn main() {
 
                             if !cli.quiet && color_type != 3 {
                                 println!(
-                                    "  (i) Reducing color type from {} to {} (Color count in image: {})",
+                                    "  (i) Reducing color type from {} to {} ({} bit, Color count: {})",
                                          color_type_name(old_color_type),
                                          color_type_name(out_color_type),
+                                         out_bit_depth,
                                          palette_map.len()
                                 );
                             }
@@ -1414,7 +1464,7 @@ fn main() {
         let shared_palette = final_palette.map(Arc::new);
         let shared_trns = final_trns.map(Arc::new);
 
-        if !cli.quiet {
+        if !cli.quiet && !cli.nz {
             println!(
                 "  Image loaded ........ : {} bytes ({}) in memory.",
                      raw_pixels.len(),
@@ -1621,13 +1671,15 @@ fn main() {
                         best.zc, best.zm, best.zs, best.f,
                     );
                 }
-                println!(
-                    "  New image data size . : {} bytes ({})\n  vs original ......... : {} bytes ({})",
-                         global_best_size,
-                         format_bytes(global_best_size),
-                             orig_idat_size,
-                         format_bytes(orig_idat_size),
-                );
+                if !cli.nz {
+                    println!(
+                        "  New image data size . : {} bytes ({})\n  vs original ......... : {} bytes ({})",
+                            global_best_size,
+                            format_bytes(global_best_size),
+                                orig_idat_size,
+                            format_bytes(orig_idat_size),
+                    );
+                }
             }
 
             // Skip file modification if trial result is larger/equal (unless -force or -nz is specified)
@@ -1653,7 +1705,7 @@ fn main() {
 
                 let orig_metadata = fs::metadata(&original_path).ok();
                 let is_in_place = out_path == original_path;
-                let old_path = PathBuf::from(format!("{}.bak", file_path));
+                let old_path = PathBuf::from(format!("{}.bak.{}", file_path, std::process::id()));
 
                 if is_in_place {
                     if let Err(e) = fs::rename(&original_path, &old_path) {
