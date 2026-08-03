@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 use std::env;
 use std::ffi::{c_void, CString};
+use std::ffi::CStr;
 use std::fs::{self, FileTimes, Metadata};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use pngstreamdec::{
     close_png, decode_scanlines, open_png, png_get_idat_size, png_set_count_idat_size,
+    png_get_text_count, png_get_text_data,
 };
 use pngstreamenc::{
     close_png_encode, close_png_encode_get_idat_size, encode_scanlines, open_png_encode,
@@ -45,9 +47,13 @@ struct CliArgs {
     nb: bool,
     np: bool,
     nx: bool,
+    nz: bool,
     out_file: Option<String>,
     out_dir: Option<String>,
     show_help: bool,
+    force_trials: bool,
+    force_reenc: bool,
+    cmd_options: String,
 }
 
 struct LoadedImage {
@@ -362,29 +368,230 @@ fn load_external_image(file_path: &str) -> Result<LoadedImage, String> {
 }
 
 // =========================================================================
+// RAW PNG CHUNK COPY & RE-PARTITIONING FOR -o0 / -nz
+// =========================================================================
+
+fn make_crc_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    for n in 0..256 {
+        let mut c = n as u32;
+        for _ in 0..8 {
+            if c & 1 != 0 {
+                c = 0xEDB8_8320 ^ (c >> 1);
+            } else {
+                c >>= 1;
+            }
+        }
+        table[n] = c;
+    }
+    table
+}
+
+fn update_crc(mut crc: u32, table: &[u32; 256], buf: &[u8]) -> u32 {
+    for &b in buf {
+        crc = table[((crc ^ (b as u32)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+fn png_crc(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
+    let table = make_crc_table();
+    let mut crc = 0xFFFF_FFFFu32;
+    crc = update_crc(crc, &table, chunk_type);
+    crc = update_crc(crc, &table, data);
+    !crc
+}
+
+/// Copies existing compressed IDAT bytes from an existing PNG without zlib re-encoding,
+/// coalesces IDAT chunks, and inserts/updates the `tEXt` metadata chunk.
+fn copy_png_idat_and_add_text(
+    in_path: &Path,
+    out_path: &Path,
+    text_keyword: &str,
+    text_value: &str,
+) -> Result<usize, String> {
+    let raw_data = fs::read(in_path).map_err(|e| format!("Failed to read input file: {}", e))?;
+    if raw_data.len() < 8 || &raw_data[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return Err("Not a valid PNG file".to_string());
+    }
+
+    let mut pos = 8;
+    let mut chunks_before_idat: Vec<Vec<u8>> = Vec::new();
+    let mut chunks_after_idat: Vec<Vec<u8>> = Vec::new();
+    let mut combined_idat: Vec<u8> = Vec::new();
+    let mut seen_idat = false;
+
+    while pos + 12 <= raw_data.len() {
+        let length = u32::from_be_bytes(raw_data[pos..pos + 4].try_into().unwrap()) as usize;
+        let chunk_type: [u8; 4] = raw_data[pos + 4..pos + 8].try_into().unwrap();
+        let data_start = pos + 8;
+        let data_end = data_start + length;
+        let crc_start = data_end;
+
+        if crc_start + 4 > raw_data.len() {
+            return Err("PNG chunk extended beyond EOF".to_string());
+        }
+
+        pos = crc_start + 4;
+        let chunk_data = &raw_data[data_start..data_end];
+
+        match &chunk_type {
+            b"IHDR" => {
+                let mut full_chunk = Vec::with_capacity(12 + length);
+                full_chunk.extend_from_slice(&(length as u32).to_be_bytes());
+                full_chunk.extend_from_slice(&chunk_type);
+                full_chunk.extend_from_slice(chunk_data);
+                let crc = png_crc(&chunk_type, chunk_data);
+                full_chunk.extend_from_slice(&crc.to_be_bytes());
+                chunks_before_idat.push(full_chunk);
+            }
+            b"IDAT" => {
+                seen_idat = true;
+                combined_idat.extend_from_slice(chunk_data);
+            }
+            b"IEND" => {
+                break;
+            }
+            b"tEXt" => {
+                // Remove pre-existing optipng-rs text chunk if updating
+                if let Some(null_idx) = chunk_data.iter().position(|&b| b == 0) {
+                    if let Ok(keyword) = std::str::from_utf8(&chunk_data[..null_idx]) {
+                        if keyword == text_keyword {
+                            continue;
+                        }
+                    }
+                }
+                let mut full_chunk = Vec::with_capacity(12 + length);
+                full_chunk.extend_from_slice(&(length as u32).to_be_bytes());
+                full_chunk.extend_from_slice(&chunk_type);
+                full_chunk.extend_from_slice(chunk_data);
+                let crc = png_crc(&chunk_type, chunk_data);
+                full_chunk.extend_from_slice(&crc.to_be_bytes());
+                if seen_idat {
+                    chunks_after_idat.push(full_chunk);
+                } else {
+                    chunks_before_idat.push(full_chunk);
+                }
+            }
+            _ => {
+                let mut full_chunk = Vec::with_capacity(12 + length);
+                full_chunk.extend_from_slice(&(length as u32).to_be_bytes());
+                full_chunk.extend_from_slice(&chunk_type);
+                full_chunk.extend_from_slice(chunk_data);
+                let crc = png_crc(&chunk_type, chunk_data);
+                full_chunk.extend_from_slice(&crc.to_be_bytes());
+                if seen_idat {
+                    chunks_after_idat.push(full_chunk);
+                } else {
+                    chunks_before_idat.push(full_chunk);
+                }
+            }
+        }
+    }
+
+    if combined_idat.is_empty() {
+        return Err("No IDAT chunk found in PNG file".to_string());
+    }
+
+    let mut out_file = fs::File::create(out_path).map_err(|e| format!("Failed to create output file: {}", e))?;
+
+    // 1. Write Header
+    out_file.write_all(b"\x89PNG\r\n\x1a\n").map_err(|e| e.to_string())?;
+
+    // 2. Write Chunks Before IDAT (IHDR, PLTE, tRNS, etc.)
+    for chunk in &chunks_before_idat {
+        out_file.write_all(chunk).map_err(|e| e.to_string())?;
+    }
+
+    // 3. Write new tEXt chunk
+    let mut text_data = Vec::new();
+    text_data.extend_from_slice(text_keyword.as_bytes());
+    text_data.push(0); // Null byte separator
+    text_data.extend_from_slice(text_value.as_bytes());
+
+    let text_len = text_data.len() as u32;
+    let text_crc = png_crc(b"tEXt", &text_data);
+
+    out_file.write_all(&text_len.to_be_bytes()).map_err(|e| e.to_string())?;
+    out_file.write_all(b"tEXt").map_err(|e| e.to_string())?;
+    out_file.write_all(&text_data).map_err(|e| e.to_string())?;
+    out_file.write_all(&text_crc.to_be_bytes()).map_err(|e| e.to_string())?;
+
+    // 4. Write coalesced IDAT chunk(s) (Max size 0x7FFFFFFF per chunk)
+    const MAX_IDAT_CHUNK_SIZE: usize = 0x7FFFFFFF;
+    for chunk_slice in combined_idat.chunks(MAX_IDAT_CHUNK_SIZE) {
+        let idat_len = chunk_slice.len() as u32;
+        let idat_crc = png_crc(b"IDAT", chunk_slice);
+
+        out_file.write_all(&idat_len.to_be_bytes()).map_err(|e| e.to_string())?;
+        out_file.write_all(b"IDAT").map_err(|e| e.to_string())?;
+        out_file.write_all(chunk_slice).map_err(|e| e.to_string())?;
+        out_file.write_all(&idat_crc.to_be_bytes()).map_err(|e| e.to_string())?;
+    }
+
+    // 5. Write Chunks After IDAT
+    for chunk in &chunks_after_idat {
+        out_file.write_all(chunk).map_err(|e| e.to_string())?;
+    }
+
+    // 6. Write IEND chunk
+    let iend_crc = png_crc(b"IEND", &[]);
+    out_file.write_all(&0u32.to_be_bytes()).map_err(|e| e.to_string())?;
+    out_file.write_all(b"IEND").map_err(|e| e.to_string())?;
+    out_file.write_all(&iend_crc.to_be_bytes()).map_err(|e| e.to_string())?;
+
+    out_file.flush().map_err(|e| e.to_string())?;
+
+    Ok(combined_idat.len())
+}
+
+// =========================================================================
 // HELPER FUNCTIONS & CLI PARSER
 // =========================================================================
 
 fn print_usage() {
-    println!("optipng-rs: High-performance parallel PNG optimizer and converter\n");
-    println!("USAGE:");
-    println!("  optipng-rs [options] <file1.png> [file2.png ...]");
-    println!("  optipng-rs [options] -e <input_file> [output.png]\n");
-    println!("OPTIONS:");
-    println!("  -o <level>         Optimization level 0-7 (default: 2)");
-    println!("  -mt <threads>      Number of worker threads (default: 75% of CPUs)");
-    println!("  -e <file>          External input file format (TGA, PPM, PGM, PAM) to encode");
-    println!("  -out <file>        Output file path");
-    println!("  -dir <directory>   Output directory");
-    println!("  -zc <levels>       zlib compression levels (e.g. -zc1-9 or -zc9)");
-    println!("  -zm <levels>       zlib memory levels (e.g. -zm1-9 or -zm8,9)");
-    println!("  -zs <strategies>   zlib compression strategies (e.g. -zs0-3)");
-    println!("  -f <filters>       PNG delta filter algorithms (e.g. -f0,5 or -f0-5)");
-    println!("  -nc                Disable color type & transparency reduction");
-    println!("  -backup, -keep     Keep backup copy of original file (.bak)");
-    println!("  -simulate          Simulation mode (trials only, no file writes)");
-    println!("  -quiet, -silent    Quiet mode");
-    println!("  -h, --help         Print this help message\n");
+    let version = env!("CARGO_PKG_VERSION");
+    println!(
+    r#"optipng-rs v{version} - High-performance parallel PNG optimizer and converter
+
+USAGE:
+  optipng-rs [options] <file1.png> [file2.png ...]
+  optipng-rs [options] -e <input_file> [output.png]
+
+GENERAL OPTIONS:
+  -h, --help         Print this help message
+  -quiet, -silent    Quiet mode (suppress non-error output)
+  -mt <threads>      Number of worker threads (default: 75% of CPUs)
+  -backup, -keep     Keep a backup copy of original files (.bak)
+  -simulate          Simulation mode (run trials only, skip writing files)
+  -force             Force file write even if compressed size increases
+  -ft                Force trials even if file was previously optimized
+
+OPTIMIZATION OPTIONS:
+  -o <level>         Optimization level 0-7 (default: 2)
+  -zc <levels>       zlib compression levels (e.g., -zc1-9 or -zc9)
+  -zm <levels>       zlib memory levels (e.g., -zm1-9 or -zm8,9)
+  -zs <strategies>   zlib compression strategies (e.g., -zs0-3)
+  -f <filters>       PNG delta filter algorithms (e.g., -f0,5 or -f0-5)
+  -nz                No IDAT recoding (fast path / zero re-compression)
+
+IMAGE REDUCTION OPTIONS:
+  -nb                Disable bit depth reduction
+  -nc                Disable color type reduction
+  -np                Disable palette reduction
+  -nx                Disable all image reductions (-nb, -nc, -np)
+
+INPUT / OUTPUT OPTIONS:
+  -e <file>          External input file format (TGA, PPM, PGM, PAM) to encode
+  -out <file>        Output file path
+  -dir <directory>   Output directory
+
+METADATA & DEDUPLICATION:
+  * All non-essential PNG metadata is stripped during optimization.
+  * A 'tEXt' chunk with key 'optipng-rs' is injected to track optimization state:
+  - Line 1: User-specified command options (if present).
+  - Line 2: Winning trial settings (-zc -zm -zs -f) or '-o0'."#
+    );
 }
 
 fn color_type_name(color_type: u8) -> &'static str {
@@ -451,21 +658,29 @@ fn parse_ranges_u8(input: &str) -> Vec<u8> {
     .collect()
 }
 
-fn get_opt_combinations(level: u8) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<u8>) {
+fn get_opt_combinations(level: u8, color_type: u8, bit_depth: u8) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<u8>) {
     match level {
-        0 | 1 => (vec![9], vec![8], vec![0], vec![0]),
+        0 | 1 => {
+            // OptiPNG Heuristic: Filter 0 for Palette or sub-8-bit; Adaptive (5) for Truecolor/Grayscale
+            let filter = if color_type == 3 || bit_depth < 8 {
+                vec![0]
+            } else {
+                vec![5]
+            };
+            (vec![9], vec![8], vec![0], filter)
+        }
         2 => (vec![9], vec![8], vec![0, 1, 2, 3], vec![0, 5]),
         3 => (vec![9], vec![8, 9], vec![0, 1, 2, 3], vec![0, 5]),
         4 => (vec![9], vec![8], vec![0, 1, 2, 3], vec![0, 1, 2, 3, 4, 5]),
         5 => (vec![9], vec![8, 9], vec![0, 1, 2, 3], vec![0, 1, 2, 3, 4, 5]),
         6 => ((1..=9).collect(), vec![8], vec![0, 1, 2, 3], vec![0, 1, 2, 3, 4, 5]),
         7 => ((1..=9).collect(), vec![8, 9], vec![0, 1, 2, 3], vec![0, 1, 2, 3, 4, 5]),
-        _ => get_opt_combinations(2),
+        _ => get_opt_combinations(2, color_type, bit_depth),
     }
 }
 
 fn parse_args() -> CliArgs {
-    let mut args = env::args().skip(1);
+    let raw_args: Vec<String> = env::args().skip(1).collect();
     let mut cli = CliArgs {
         files: Vec::new(),
         external_input: None,
@@ -482,20 +697,32 @@ fn parse_args() -> CliArgs {
         nb: false,
         np: false,
         nx: false,
+        nz: false,
         out_file: None,
         out_dir: None,
         show_help: false,
+        force_trials: false,
+        force_reenc: false,
+        cmd_options: String::new(),
     };
 
-    while let Some(arg) = args.next() {
+    let mut opt_tokens: Vec<String> = Vec::new();
+    let mut i = 0;
+
+    while i < raw_args.len() {
+        let arg = &raw_args[i];
+
         if arg == "-h" || arg == "--help" {
             cli.show_help = true;
             return cli;
         }
 
         if arg == "-e" {
-            if let Some(val) = args.next() {
-                cli.external_input = Some(val);
+            opt_tokens.push(arg.clone());
+            i += 1;
+            if i < raw_args.len() {
+                cli.external_input = Some(raw_args[i].clone());
+                i += 1;
             } else {
                 eprintln!("Error: Option -e requires an input file argument.");
                 cli.show_help = true;
@@ -504,85 +731,195 @@ fn parse_args() -> CliArgs {
             continue;
         }
 
+        if arg == "-out" {
+            opt_tokens.push(arg.clone());
+            i += 1;
+            if i < raw_args.len() {
+                cli.out_file = Some(raw_args[i].clone());
+                i += 1;
+            }
+            continue;
+        }
+
+        if arg == "-dir" {
+            opt_tokens.push(arg.clone());
+            i += 1;
+            if i < raw_args.len() {
+                cli.out_dir = Some(raw_args[i].clone());
+                i += 1;
+            }
+            continue;
+        }
+
+        if arg == "-ft" {
+            cli.force_trials = true;
+            opt_tokens.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if arg == "-force" {
+            cli.force_reenc = true;
+            opt_tokens.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
         if arg.starts_with("-o") && arg.len() > 2 && arg[2..].chars().all(|c| c.is_ascii_digit()) {
             let level: u8 = arg[2..].parse().unwrap_or(2);
             cli.opt_level = level.min(7);
+            opt_tokens.push(arg.clone());
+            i += 1;
             continue;
         }
 
         if arg.starts_with("-mt") && arg.len() > 3 && arg[3..].chars().all(|c| c.is_ascii_digit()) {
             cli.mt = arg[3..].parse().unwrap_or(0);
+            opt_tokens.push(arg.clone());
+            i += 1;
             continue;
         }
 
         if arg.starts_with("-zc") {
-            let val_str = if arg.len() > 3 { Some(arg[3..].to_string()) } else { args.next() };
+            let val_str = if arg.len() > 3 {
+                opt_tokens.push(arg.clone());
+                Some(arg[3..].to_string())
+            } else {
+                opt_tokens.push(arg.clone());
+                i += 1;
+                if i < raw_args.len() {
+                    opt_tokens.push(raw_args[i].clone());
+                    Some(raw_args[i].clone())
+                } else {
+                    None
+                }
+            };
             if let Some(v) = val_str {
                 let mut parsed = parse_ranges_i32(&v);
                 cli.zc.get_or_insert_with(Vec::new).append(&mut parsed);
             }
+            i += 1;
             continue;
         }
 
         if arg.starts_with("-zm") {
-            let val_str = if arg.len() > 3 { Some(arg[3..].to_string()) } else { args.next() };
+            let val_str = if arg.len() > 3 {
+                opt_tokens.push(arg.clone());
+                Some(arg[3..].to_string())
+            } else {
+                opt_tokens.push(arg.clone());
+                i += 1;
+                if i < raw_args.len() {
+                    opt_tokens.push(raw_args[i].clone());
+                    Some(raw_args[i].clone())
+                } else {
+                    None
+                }
+            };
             if let Some(v) = val_str {
                 let mut parsed = parse_ranges_i32(&v);
                 cli.zm.get_or_insert_with(Vec::new).append(&mut parsed);
             }
+            i += 1;
             continue;
         }
 
         if arg.starts_with("-zs") {
-            let val_str = if arg.len() > 3 { Some(arg[3..].to_string()) } else { args.next() };
+            let val_str = if arg.len() > 3 {
+                opt_tokens.push(arg.clone());
+                Some(arg[3..].to_string())
+            } else {
+                opt_tokens.push(arg.clone());
+                i += 1;
+                if i < raw_args.len() {
+                    opt_tokens.push(raw_args[i].clone());
+                    Some(raw_args[i].clone())
+                } else {
+                    None
+                }
+            };
             if let Some(v) = val_str {
                 let mut parsed = parse_ranges_i32(&v);
                 cli.zs.get_or_insert_with(Vec::new).append(&mut parsed);
             }
+            i += 1;
             continue;
         }
 
         if arg.starts_with("-f") {
-            let val_str = if arg.len() > 2 { Some(arg[2..].to_string()) } else { args.next() };
+            let val_str = if arg.len() > 2 {
+                opt_tokens.push(arg.clone());
+                Some(arg[2..].to_string())
+            } else {
+                opt_tokens.push(arg.clone());
+                i += 1;
+                if i < raw_args.len() {
+                    opt_tokens.push(raw_args[i].clone());
+                    Some(raw_args[i].clone())
+                } else {
+                    None
+                }
+            };
             if let Some(v) = val_str {
                 let mut parsed = parse_ranges_u8(&v);
                 cli.f.get_or_insert_with(Vec::new).append(&mut parsed);
             }
+            i += 1;
             continue;
         }
 
         match arg.as_str() {
             "-o" => {
-                if let Some(val) = args.next() {
-                    let level: u8 = val.parse().unwrap_or(2);
+                opt_tokens.push(arg.clone());
+                i += 1;
+                if i < raw_args.len() {
+                    opt_tokens.push(raw_args[i].clone());
+                    let level: u8 = raw_args[i].parse().unwrap_or(2);
                     cli.opt_level = level.min(7);
+                    i += 1;
                 }
             }
             "-mt" => {
-                if let Some(val) = args.next() {
-                    cli.mt = val.parse().unwrap_or(0);
+                opt_tokens.push(arg.clone());
+                i += 1;
+                if i < raw_args.len() {
+                    opt_tokens.push(raw_args[i].clone());
+                    cli.mt = raw_args[i].parse().unwrap_or(0);
+                    i += 1;
                 }
             }
-            "-backup" | "-keep" => cli.backup = true,
-            "-simulate" => cli.simulate = true,
-            "-quiet" | "-silent" => cli.quiet = true,
-            "-nc" => cli.nc = true,
-            "-nb" => cli.nb = true,
-            "-np" => cli.np = true,
-            "-nx" => cli.nx = true,
-            "-out" => cli.out_file = args.next(),
-            "-dir" => cli.out_dir = args.next(),
+            "-backup" | "-keep" => { cli.backup = true; opt_tokens.push(arg.clone()); i += 1; }
+            "-simulate" => { cli.simulate = true; opt_tokens.push(arg.clone()); i += 1; }
+            "-quiet" | "-silent" => { cli.quiet = true; opt_tokens.push(arg.clone()); i += 1; }
+            "-nc" => { cli.nc = true; opt_tokens.push(arg.clone()); i += 1; }
+            "-nb" => { cli.nb = true; opt_tokens.push(arg.clone()); i += 1; }
+            "-np" => { cli.np = true; opt_tokens.push(arg.clone()); i += 1; }
+            "-nx" => { cli.nx = true; opt_tokens.push(arg.clone()); i += 1; }
+            "-nz" => { cli.nz = true; opt_tokens.push(arg.clone()); i += 1; }
             "--" => {
-                cli.files.extend(args);
+                opt_tokens.push(arg.clone());
+                i += 1;
+                cli.files.extend(raw_args[i..].iter().cloned());
                 break;
             }
             _ => {
-                if !arg.starts_with('-') {
-                    cli.files.push(arg);
+                if arg.starts_with('-') {
+                    opt_tokens.push(arg.clone());
+                } else {
+                    cli.files.push(arg.clone());
                 }
+                i += 1;
             }
         }
+
+        // Implement level 0
+        if cli.opt_level == 0 {
+            cli.nx = true;
+            cli.nz = true;
+        }
     }
+
+    cli.cmd_options = opt_tokens.join(" ");
 
     if let Some(ref mut list) = cli.zc { list.sort_unstable(); list.dedup(); }
     if let Some(ref mut list) = cli.zm { list.sort_unstable(); list.dedup(); }
@@ -664,32 +1001,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    let (def_zc, def_zm, def_zs, def_f) = get_opt_combinations(cli.opt_level);
-    let zc_list = cli.zc.clone().unwrap_or(def_zc);
-    let zm_list = cli.zm.clone().unwrap_or(def_zm);
-    let zs_list = cli.zs.clone().unwrap_or(def_zs);
-    let f_list = cli.f.clone().unwrap_or(def_f);
-
-    let mut trials = Vec::new();
-    for &zc in &zc_list {
-        for &zm in &zm_list {
-            for &zs in &zs_list {
-                if (zs == 2 || zs == 3) && zc > 1 {
-                    continue;
-                }
-                for &f in &f_list {
-                    trials.push(TrialConfig { zc, zm, zs, f });
-                }
-            }
-        }
-    }
-
-    // Sort difficult trials first (LPT Scheduling)
-    trials.sort_by_key(|t| Reverse((t.zc, zs_difficulty(t.zs), t.zm, t.f)));
-
-    let total_trials = trials.len();
-    let trials = Arc::new(trials);
-
     // Prepare list of file target tasks: (Input path, Output path, is_external)
     let mut tasks: Vec<(String, String, bool)> = Vec::new();
 
@@ -710,10 +1021,6 @@ fn main() {
     }
 
     for (file_path, target_out_path, is_external) in tasks {
-        if !cli.quiet {
-            println!("Processing: {} ({} trials, with {} parallel threads)", file_path, total_trials, cli.mt);
-        }
-
         let mut width: u32 = 0;
         let mut height: u32 = 0;
         let mut bit_depth: u8 = 0;
@@ -758,22 +1065,58 @@ fn main() {
                 continue;
             }
 
+            // Check if file was already optimized by optipng-rs
+            if !cli.force_trials {
+                let count = png_get_text_count(dec);
+                let mut already_optimized = false;
+
+                for idx in 0..count {
+                    let mut kw_ptr: *const std::os::raw::c_char = std::ptr::null();
+                    let mut txt_ptr: *const std::os::raw::c_char = std::ptr::null();
+                    if png_get_text_data(dec, idx, &mut kw_ptr, &mut txt_ptr) {
+                        if !kw_ptr.is_null() {
+                            let keyword = unsafe { CStr::from_ptr(kw_ptr) }.to_str().unwrap_or("");
+                            if keyword == "optipng-rs" {
+                                already_optimized = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if already_optimized {
+                    if !cli.quiet {
+                        println!("  (i) File is already optimized by optipng-rs. Skipping (use -ft and/or -force to re-process).");
+                    }
+                    close_png(dec);
+                    continue;
+                }
+            }
+
             stride = stride_usize;
             png_set_count_idat_size(dec, true);
 
-            let expected_size = stride * height as usize;
-            raw_pixels = Vec::with_capacity(expected_size);
+            if cli.nz {
+                // -o0 / -nz fast path: Skip scanline decoding completely to save memory & CPU cycles
+                raw_pixels = Vec::new();
+                orig_idat_size = png_get_idat_size(dec);
+                close_png(dec);
+            } else {
+                // Standard path: Decode scanlines into memory for color reduction and re-encoding trials
+                let expected_size = stride * height as usize;
+                raw_pixels = Vec::with_capacity(expected_size);
 
-            loop {
-                let res = decode_scanlines(dec, 1024);
-                if res.size == 0 || res.data.is_null() {
-                    break;
+                loop {
+                    let res = decode_scanlines(dec, 1024);
+                    if res.size == 0 || res.data.is_null() {
+                        break;
+                    }
+                    let chunk = unsafe { std::slice::from_raw_parts(res.data, res.size) };
+                    raw_pixels.extend_from_slice(chunk);
                 }
-                let chunk = unsafe { std::slice::from_raw_parts(res.data, res.size) };
-                raw_pixels.extend_from_slice(chunk);
+                orig_idat_size = png_get_idat_size(dec);
+                close_png(dec);
             }
-            orig_idat_size = png_get_idat_size(dec);
-            close_png(dec);
         }
 
         if !cli.quiet {
@@ -1075,139 +1418,189 @@ fn main() {
             );
         }
 
-        // 3. Parallel encoding trials (Dynamic Work Stealing Queue)
         let image_data = Arc::new(raw_pixels);
-        let mut handles = Vec::new();
 
-        let next_trial_index = Arc::new(AtomicUsize::new(0));
-        let completed_trials = Arc::new(AtomicUsize::new(0));
-        let completed_scanlines = Arc::new(AtomicUsize::new(0));
-        let stdout_lock = Arc::new(std::sync::Mutex::new(()));
+        // --- Generate trials for this image using heuristics ---
+        let (def_zc, def_zm, def_zs, def_f) = get_opt_combinations(cli.opt_level, out_color_type, out_bit_depth);
+        let zc_list = cli.zc.clone().unwrap_or(def_zc);
+        let zm_list = cli.zm.clone().unwrap_or(def_zm);
+        let zs_list = cli.zs.clone().unwrap_or(def_zs);
+        let f_list = cli.f.clone().unwrap_or(def_f);
 
-        let total_rows = height as usize;
-        let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
-        let total_scanlines = total_trials * total_rows;
+        let mut global_best_config: Option<TrialConfig> = None;
+        let mut global_best_size: usize = usize::MAX;
+        let total_trials: usize;
 
-        let start_trials = Instant::now();
-
-        for _ in 0..cli.mt {
-            let trials_clone = Arc::clone(&trials);
-            let img = Arc::clone(&image_data);
-            let palette_clone = shared_palette.clone();
-            let trns_clone = shared_trns.clone();
-            let next_idx = Arc::clone(&next_trial_index);
-            let completed = Arc::clone(&completed_trials);
-            let scanlines_acc = Arc::clone(&completed_scanlines);
-            let lock = Arc::clone(&stdout_lock);
-            let quiet = cli.quiet;
-
-            handles.push(thread::spawn(move || {
-                let mut best_size = usize::MAX;
-                let mut best_config = None;
-                let chunk_rows = 250;
-
-                loop {
-                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                    if idx >= trials_clone.len() {
-                        break;
+        if cli.nz {
+            // Fast Path: 0 trials. Bypass worker threads completely.
+            if !cli.quiet {
+                println!("  (-nz) IDAT recoding disabled. Skipping trials...");
+            }
+            global_best_config = Some(TrialConfig {
+                zc: zc_list[0],
+                zm: zm_list[0],
+                zs: zs_list[0],
+                f: f_list[0],
+            });
+            global_best_size = orig_idat_size;
+            total_trials = 0;
+        } else {
+            // Run standard parallel trial queue...
+            let mut trials = Vec::new();
+            for &zc in &zc_list {
+                for &zm in &zm_list {
+                    for &zs in &zs_list {
+                        if (zs == 2 || zs == 3) && zc > 1 {
+                            continue;
+                        }
+                        for &f in &f_list {
+                            trials.push(TrialConfig { zc, zm, zs, f });
+                        }
                     }
+                }
+            }
 
-                    let trial = &trials_clone[idx];
-                    let mut dummy_written: usize = 0;
-                    let options = ZlibOptions {
-                        level: trial.zc,
-                        strategy: trial.zs,
-                        window_bits: 15,
-                        mem_level: trial.zm,
-                        max_idat_size: 32768,
-                        expected_idat_size: 0,
-                    };
+            trials.sort_by_key(|t| Reverse((t.zc, zs_difficulty(t.zs), t.zm, t.f)));
+            total_trials = trials.len();
+            let trials = Arc::new(trials);
 
-                    // Derive pointers for palette
-                    let (pal_ptr, pal_len) = match &palette_clone {
-                        Some(pal) => (pal.as_ptr(), pal.len()),
-                        None => (std::ptr::null(), 0),
-                    };
+            if !cli.quiet {
+                println!("Processing: {} ({} trials, with {} parallel threads)", file_path, total_trials, cli.mt);
+            }
 
-                    let (trns_ptr, trns_len) = match &trns_clone {
-                        Some(trns) => (trns.as_ptr(), trns.len()),
-                        None => (std::ptr::null(), 0),
-                    };
+            // 3. Parallel encoding trials (Dynamic Work Stealing Queue)
+            let mut handles = Vec::new();
 
-                    let enc = open_png_encode_stream(
-                        counter_write_cb,
-                        &mut dummy_written as *mut _ as *mut c_void,
-                        width,
-                        height,
-                        out_bit_depth,
-                        out_color_type,
-                        trial.f,
-                        pal_ptr,
-                        pal_len,
-                        trns_ptr,
-                        trns_len,
-                        options,
-                    );
+            let next_trial_index = Arc::new(AtomicUsize::new(0));
+            let completed_trials = Arc::new(AtomicUsize::new(0));
+            let completed_scanlines = Arc::new(AtomicUsize::new(0));
+            let stdout_lock = Arc::new(std::sync::Mutex::new(()));
 
-                    if !enc.is_null() {
-                        let mut encoded_rows = 0usize;
-                        while encoded_rows < total_rows {
-                            let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
-                            let offset = encoded_rows * row_bytes;
-                            let ptr = unsafe { img.as_ptr().add(offset) };
+            let total_rows = height as usize;
+            let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
+            let total_scanlines = total_trials * total_rows;
 
-                            encode_scanlines(enc, ptr, rows_to_encode as u32);
-                            encoded_rows += rows_to_encode;
+            let start_trials = Instant::now();
 
-                            let cur_scanlines = scanlines_acc.fetch_add(rows_to_encode, Ordering::Relaxed) + rows_to_encode;
+            for _ in 0..cli.mt {
+                let trials_clone = Arc::clone(&trials);
+                let img = Arc::clone(&image_data);
+                let palette_clone = shared_palette.clone();
+                let trns_clone = shared_trns.clone();
+                let next_idx = Arc::clone(&next_trial_index);
+                let completed = Arc::clone(&completed_trials);
+                let scanlines_acc = Arc::clone(&completed_scanlines);
+                let lock = Arc::clone(&stdout_lock);
+                let quiet = cli.quiet;
 
-                            if !quiet && total_scanlines > 0 {
-                                let done = completed.load(Ordering::Relaxed);
-                                let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
-                                if let Ok(_guard) = lock.try_lock() {
-                                    print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
-                                    let _ = io::stdout().flush();
+                handles.push(thread::spawn(move || {
+                    let mut best_size = usize::MAX;
+                    let mut best_config = None;
+                    let chunk_rows = 250;
+
+                    loop {
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= trials_clone.len() {
+                            break;
+                        }
+
+                        let trial = &trials_clone[idx];
+                        let mut dummy_written: usize = 0;
+                        let options = ZlibOptions {
+                            level: trial.zc,
+                            strategy: trial.zs,
+                            window_bits: 15,
+                            mem_level: trial.zm,
+                            max_idat_size: 32768,
+                            expected_idat_size: 0,
+                        };
+
+                        // Derive pointers for palette
+                        let (pal_ptr, pal_len) = match &palette_clone {
+                            Some(pal) => (pal.as_ptr(), pal.len()),
+                            None => (std::ptr::null(), 0),
+                        };
+
+                        let (trns_ptr, trns_len) = match &trns_clone {
+                            Some(trns) => (trns.as_ptr(), trns.len()),
+                            None => (std::ptr::null(), 0),
+                        };
+
+                        let enc = open_png_encode_stream(
+                            counter_write_cb,
+                            &mut dummy_written as *mut _ as *mut c_void,
+                            width,
+                            height,
+                            out_bit_depth,
+                            out_color_type,
+                            trial.f,
+                            pal_ptr,
+                            pal_len,
+                            trns_ptr,
+                            trns_len,
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            0,
+                            options,
+                        );
+
+                        if !enc.is_null() {
+                            let mut encoded_rows = 0usize;
+                            while encoded_rows < total_rows {
+                                let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
+                                let offset = encoded_rows * row_bytes;
+                                let ptr = unsafe { img.as_ptr().add(offset) };
+
+                                encode_scanlines(enc, ptr, rows_to_encode as u32);
+                                encoded_rows += rows_to_encode;
+
+                                let cur_scanlines = scanlines_acc.fetch_add(rows_to_encode, Ordering::Relaxed) + rows_to_encode;
+
+                                if !quiet && total_scanlines > 0 {
+                                    let done = completed.load(Ordering::Relaxed);
+                                    let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
+                                    if let Ok(_guard) = lock.try_lock() {
+                                        print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
+                                        let _ = io::stdout().flush();
+                                    }
                                 }
+                            }
+
+                            let trial_idat_size = close_png_encode_get_idat_size(enc);
+
+                            if trial_idat_size < best_size && trial_idat_size > 0 {
+                                best_size = trial_idat_size;
+                                best_config = Some(trial.clone());
                             }
                         }
 
-                        let trial_idat_size = close_png_encode_get_idat_size(enc);
-
-                        if trial_idat_size < best_size && trial_idat_size > 0 {
-                            best_size = trial_idat_size;
-                            best_config = Some(trial.clone());
+                        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if !quiet && total_scanlines > 0 {
+                            let cur_scanlines = scanlines_acc.load(Ordering::Relaxed);
+                            let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
+                            if let Ok(_guard) = lock.try_lock() {
+                                print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
+                                let _ = io::stdout().flush();
+                            }
                         }
                     }
+                    (best_size, best_config)
+                }));
+            }
 
-                    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if !quiet && total_scanlines > 0 {
-                        let cur_scanlines = scanlines_acc.load(Ordering::Relaxed);
-                        let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
-                        if let Ok(_guard) = lock.try_lock() {
-                            print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
-                            let _ = io::stdout().flush();
-                        }
+            for handle in handles {
+                if let Ok((size, Some(config))) = handle.join() {
+                    if size < global_best_size {
+                        global_best_size = size;
+                        global_best_config = Some(config);
                     }
-                }
-                (best_size, best_config)
-            }));
-        }
-
-        let mut global_best_size = usize::MAX;
-        let mut global_best_config = None;
-
-        for handle in handles {
-            if let Ok((size, Some(config))) = handle.join() {
-                if size < global_best_size {
-                    global_best_size = size;
-                    global_best_config = Some(config);
                 }
             }
-        }
 
-        let trial_duration = start_trials.elapsed();
-        if !cli.quiet {
-            println!("\r  Trial process took .. : {}                       ", format_duration(trial_duration));
+            let trial_duration = start_trials.elapsed();
+            if !cli.quiet {
+                println!("\r  Trial process took .. : {}                       ", format_duration(trial_duration));
+            }
         }
 
         // 4. Final Output Write
@@ -1218,7 +1611,7 @@ fn main() {
                         "  Best parameters ..... : -zc{} -zm{} -zs{} -f{}",
                         best.zc, best.zm, best.zs, best.f,
                     );
-                } else {
+                } else if !cli.nz {
                     println!(
                         "  Used parameters ..... : -zc{} -zm{} -zs{} -f{}",
                         best.zc, best.zm, best.zs, best.f,
@@ -1226,15 +1619,15 @@ fn main() {
                 }
                 println!(
                     "  New image data size . : {} bytes ({})\n  vs original ......... : {} bytes ({})",
-                    global_best_size,
-                    format_bytes(global_best_size),
-                    orig_idat_size,
-                    format_bytes(orig_idat_size),
+                         global_best_size,
+                         format_bytes(global_best_size),
+                             orig_idat_size,
+                         format_bytes(orig_idat_size),
                 );
             }
 
-            // For existing PNGs, skip file modification if trial result is larger
-            if !is_external && global_best_size >= orig_idat_size {
+            // Skip file modification if trial result is larger/equal (unless -force or -nz is specified)
+            if !cli.force_reenc && !is_external && global_best_size >= orig_idat_size && !cli.nz {
                 if !cli.quiet {
                     println!("  /!\\ No compression improvement over source IDAT size. Skipping file write.");
                 }
@@ -1265,71 +1658,102 @@ fn main() {
                     }
                 }
 
-                let c_out_path = CString::new(out_path.to_string_lossy().into_owned()).unwrap();
-                let final_options = ZlibOptions {
-                    level: best.zc,
-                    strategy: best.zs,
-                    window_bits: 15,
-                    mem_level: best.zm,
-                    max_idat_size: 0, // 0 defaults to 0x7FFFFFFF max chunk size
-                    expected_idat_size: global_best_size, // Direct streaming mode enabled
-                };
+                let input_source = if is_in_place { &old_path } else { &original_path };
 
-                // Derive pointers for palette from Arc containers
-                let (pal_ptr, pal_len) = match &shared_palette {
-                    Some(pal) => (pal.as_ptr(), pal.len()),
-                    None => (std::ptr::null(), 0),
+                let opt_info = if cli.opt_level == 0 {
+                    "-o0".to_string()
+                } else if cli.cmd_options.is_empty() {
+                    format!("{}{}{}{}", best.zc, best.zm, best.zs, best.f)
+                } else {
+                    format!("{}\n{}{}{}{}", cli.cmd_options, best.zc, best.zm, best.zs, best.f)
                 };
-
-                let (trns_ptr, trns_len) = match &shared_trns {
-                    Some(trns) => (trns.as_ptr(), trns.len()),
-                    None => (std::ptr::null(), 0),
-                };
-
-                let enc = open_png_encode(
-                    c_out_path.as_ptr(),
-                    width,
-                    height,
-                    out_bit_depth,
-                    out_color_type,
-                    best.f,
-                    pal_ptr,
-                    pal_len,
-                    trns_ptr,
-                    trns_len,
-                    final_options,
-                );
 
                 let mut success = false;
-                if !enc.is_null() {
-                    let total_rows = height as usize;
-                    let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
-                    let mut encoded_rows = 0usize;
-                    let chunk_rows = 250;
 
-                    while encoded_rows < total_rows {
-                        let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
-                        let offset = encoded_rows * row_bytes;
-                        let ptr = unsafe { image_data.as_ptr().add(offset) };
-
-                        encode_scanlines(enc, ptr, rows_to_encode as u32);
-                        encoded_rows += rows_to_encode;
-
-                        if !cli.quiet {
-                            let pct = (encoded_rows as f64 / total_rows as f64) * 100.0;
-                            print!("\r  Final encoding ...... : {:.2} percent done", pct);
-                            let _ = io::stdout().flush();
+                if cli.nz && !is_external {
+                    // Fast Path (-o0 / -nz): Direct raw IDAT stream copy & chunk coalescing without zlib re-encoding
+                    match copy_png_idat_and_add_text(input_source, &out_path, "optipng-rs", &opt_info) {
+                        Ok(_) => {
+                            success = out_path.exists();
+                        }
+                        Err(e) => {
+                            eprintln!("  (x) Failed to copy IDAT and write text chunk: {}", e);
                         }
                     }
+                } else {
+                    // Standard Path: Full zlib re-encoding stream
+                    let c_out_path = CString::new(out_path.to_string_lossy().into_owned()).unwrap();
+                    let final_options = ZlibOptions {
+                        level: best.zc,
+                        strategy: best.zs,
+                        window_bits: 15,
+                        mem_level: best.zm,
+                        max_idat_size: 0,
+                        expected_idat_size: global_best_size,
+                    };
 
-                    close_png_encode(enc);
-                    success = out_path.exists();
+                    let (pal_ptr, pal_len) = match &shared_palette {
+                        Some(pal) => (pal.as_ptr(), pal.len()),
+                        None => (std::ptr::null(), 0),
+                    };
+
+                    let (trns_ptr, trns_len) = match &shared_trns {
+                        Some(trns) => (trns.as_ptr(), trns.len()),
+                        None => (std::ptr::null(), 0),
+                    };
+
+                    let c_key = CString::new("optipng-rs").unwrap();
+                    let c_val = CString::new(opt_info).unwrap();
+                    let text_keys = [c_key.as_ptr()];
+                    let text_vals = [c_val.as_ptr()];
+
+                    let enc = open_png_encode(
+                        c_out_path.as_ptr(),
+                                              width,
+                                              height,
+                                              out_bit_depth,
+                                              out_color_type,
+                                              best.f,
+                                              pal_ptr,
+                                              pal_len,
+                                              trns_ptr,
+                                              trns_len,
+                                              text_keys.as_ptr(),
+                                              text_vals.as_ptr(),
+                                              1,
+                                              final_options,
+                    );
+
+                    if !enc.is_null() {
+                        let total_rows = height as usize;
+                        let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
+                        let mut encoded_rows = 0usize;
+                        let chunk_rows = 250;
+
+                        while encoded_rows < total_rows {
+                            let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
+                            let offset = encoded_rows * row_bytes;
+                            let ptr = unsafe { image_data.as_ptr().add(offset) };
+
+                            encode_scanlines(enc, ptr, rows_to_encode as u32);
+                            encoded_rows += rows_to_encode;
+
+                            if !cli.quiet {
+                                let pct = (encoded_rows as f64 / total_rows as f64) * 100.0;
+                                print!("\r  Final encoding ...... : {:.2} percent done", pct);
+                                let _ = io::stdout().flush();
+                            }
+                        }
+
+                        close_png_encode(enc);
+                        success = out_path.exists();
+                    }
                 }
 
                 if success {
                     let encode_duration = start_encode.elapsed();
                     if !cli.quiet {
-                        println!("\r  Final encoding took . : {}               ", format_duration(encode_duration));
+                        println!("\r  Final processing took : {}               ", format_duration(encode_duration));
                     }
 
                     preserve_file_times(&out_path, orig_metadata.as_ref());
