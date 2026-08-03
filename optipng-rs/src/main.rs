@@ -1572,7 +1572,7 @@ fn main() {
 
                             let trial_idat_size = close_png_encode_get_idat_size(enc);
 
-                            if trial_idat_size < best_size && trial_idat_size > 0 {
+                            if encoded_rows == total_rows && trial_idat_size < best_size && trial_idat_size > 0 {
                                 best_size = trial_idat_size;
                                 best_config = Some(trial.clone());
                             }
