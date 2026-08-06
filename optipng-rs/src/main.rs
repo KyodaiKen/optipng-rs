@@ -36,6 +36,7 @@ struct CliArgs {
     external_input: Option<String>,
     opt_level: u8,
     mt: usize,
+    zi: u8,
     zc: Option<Vec<i32>>,
     zm: Option<Vec<i32>>,
     zs: Option<Vec<i32>>,
@@ -569,6 +570,7 @@ GENERAL OPTIONS:
 
 OPTIMIZATION OPTIONS:
   -o <level>         Optimization level 0-7 (default: 2)
+  -zi <1|2>          Encoder implementation: 1 = zlib (default), 2 = Zöpfli (SLOW!!!)
   -zc <levels>       zlib compression levels (e.g., -zc1-9 or -zc9)
   -zm <levels>       zlib memory levels (e.g., -zm1-9 or -zm8,9)
   -zs <strategies>   zlib compression strategies (e.g., -zs0-3)
@@ -602,6 +604,34 @@ fn color_type_name(color_type: u8) -> &'static str {
         4 => "YA (Grayscale+Transparency)",
         6 => "RGBA (RGB+Transparency)",
         _ => "Unknown",
+    }
+}
+
+fn zc_to_zopfli_iterations(zc: i32) -> i32 {
+    match zc {
+        1 => 1,
+        2 => 3,
+        3 => 5,
+        4 => 10,
+        5 => 15,  // Zöpfli default
+        6 => 30,
+        7 => 50,
+        8 => 100,
+        9 => 500, // Maximum squeeze
+        _ => 15,
+    }
+}
+
+fn get_zopfli_opt_combinations(level: u8) -> (Vec<i32>, Vec<u8>) {
+    match level {
+        1 => (vec![1], vec![3]),
+        2 => (vec![2], vec![5]),
+        3 => (vec![3], vec![5]),
+        4 => (vec![4], vec![5]),
+        5 => (vec![5], vec![5]),
+        6 => (vec![6], vec![5]),
+        7 => (vec![7], vec![3, 5]),
+        _ => get_zopfli_opt_combinations(2),
     }
 }
 
@@ -686,6 +716,7 @@ fn parse_args() -> CliArgs {
         external_input: None,
         opt_level: 2,
         mt: 0,
+        zi: 1,
         zc: None,
         zm: None,
         zs: None,
@@ -776,6 +807,39 @@ fn parse_args() -> CliArgs {
         if arg.starts_with("-mt") && arg.len() > 3 && arg[3..].chars().all(|c| c.is_ascii_digit()) {
             cli.mt = arg[3..].parse().unwrap_or(0);
             opt_tokens.push(arg.clone());
+            i += 1;
+            continue;
+        }
+
+        if arg.starts_with("-zi") {
+            let val_str = if arg.len() > 3 {
+                opt_tokens.push(arg.clone());
+                Some(arg[3..].to_string())
+            } else {
+                opt_tokens.push(arg.clone());
+                i += 1;
+                if i < raw_args.len() {
+                    opt_tokens.push(raw_args[i].clone());
+                    Some(raw_args[i].clone())
+                } else {
+                    None
+                }
+            };
+
+            if let Some(v) = val_str {
+                if v.contains(',') || v.contains('-') {
+                    eprintln!("Error: Options like -zi1,2 or -zi1-2 are not allowed. Select either -zi1 or -zi2.");
+                    std::process::exit(1);
+                }
+                match v.parse::<u8>() {
+                    Ok(1) => cli.zi = 1,
+                    Ok(2) => cli.zi = 2,
+                    _ => {
+                        eprintln!("Error: Invalid value for -zi. Supported values are 1 (zlib) or 2 (Zöpfli).");
+                        std::process::exit(1);
+                    }
+                }
+            }
             i += 1;
             continue;
         }
@@ -1020,10 +1084,16 @@ fn main() {
         }
     }
 
+    let mut total_orig_bytes: u64 = 0;
+    let mut total_new_bytes: u64 = 0;
+    let mut total_processed_files: usize = 0;
+
     for (file_path, target_out_path, is_external) in tasks {
         if !cli.quiet {
             println!("Processing: {}", file_path);
         }
+
+        let orig_file_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
 
         let mut width: u32 = 0;
         let mut height: u32 = 0;
@@ -1475,11 +1545,30 @@ fn main() {
         let image_data = Arc::new(raw_pixels);
 
         // --- Generate trials for this image using heuristics ---
-        let (def_zc, def_zm, def_zs, def_f) = get_opt_combinations(cli.opt_level, out_color_type, out_bit_depth);
-        let zc_list = cli.zc.clone().unwrap_or(def_zc);
-        let zm_list = cli.zm.clone().unwrap_or(def_zm);
-        let zs_list = cli.zs.clone().unwrap_or(def_zs);
-        let f_list = cli.f.clone().unwrap_or(def_f);
+        let (zc_list, zm_list, zs_list, f_list) = if cli.zi == 2 {
+            // Validate Zöpfli rules: -zc range/multiple values not allowed
+            if let Some(ref user_zc) = cli.zc {
+                if user_zc.len() > 1 {
+                    eprintln!("Error: Range/multiple values for -zc are not supported when -zi2 (Zöpfli) is enabled. Please specify only one -zc level.");
+                    std::process::exit(1);
+                }
+            }
+
+            let (def_zc, def_f) = get_zopfli_opt_combinations(cli.opt_level);
+            let zc = cli.zc.clone().unwrap_or(def_zc);
+            let f = cli.f.clone().unwrap_or(def_f);
+
+            // -zm and -zs are ignored when Zöpfli is enabled
+            (zc, vec![8], vec![0], f)
+        } else {
+            let (def_zc, def_zm, def_zs, def_f) = get_opt_combinations(cli.opt_level, out_color_type, out_bit_depth);
+            (
+                cli.zc.clone().unwrap_or(def_zc),
+                cli.zm.clone().unwrap_or(def_zm),
+                cli.zs.clone().unwrap_or(def_zs),
+                cli.f.clone().unwrap_or(def_f),
+            )
+        };
 
         let mut global_best_config: Option<TrialConfig> = None;
         let mut global_best_size: usize = usize::MAX;
@@ -1560,8 +1649,15 @@ fn main() {
 
                         let trial = &trials_clone[idx];
                         let mut dummy_written: usize = 0;
+                        let z_level = if cli.zi == 2 {
+                            zc_to_zopfli_iterations(trial.zc)
+                        } else {
+                            trial.zc
+                        };
+
                         let options = ZlibOptions {
-                            level: trial.zc,
+                            z_implementation: cli.zi,
+                            level: z_level,
                             strategy: trial.zs,
                             window_bits: 15,
                             mem_level: trial.zm,
@@ -1739,8 +1835,15 @@ fn main() {
                 } else {
                     // Standard Path: Full zlib re-encoding stream
                     let c_out_path = CString::new(out_path.to_string_lossy().into_owned()).unwrap();
+                    let z_level = if cli.zi == 2 {
+                        zc_to_zopfli_iterations(best.zc)
+                    } else {
+                        best.zc
+                    };
+
                     let final_options = ZlibOptions {
-                        level: best.zc,
+                        z_implementation: cli.zi,
+                        level: z_level,
                         strategy: best.zs,
                         window_bits: 15,
                         mem_level: best.zm,
@@ -1814,9 +1917,27 @@ fn main() {
 
                     preserve_file_times(&out_path, orig_metadata.as_ref());
                     let actual_size = fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+                    let saved_file_bytes = orig_file_size.saturating_sub(actual_size);
+                    let pct_saved = if orig_file_size > 0 {
+                        (saved_file_bytes as f64 / orig_file_size as f64) * 100.0
+                    } else {
+                        0.0
+                    };
+
                     if !cli.quiet {
                         println!("  Resulting file size . : {} bytes ({})", actual_size, format_bytes(actual_size as usize));
+                        println!(
+                            "  Output size decrease  : {} bytes ({}) ({:.2}%)",
+                                 saved_file_bytes,
+                                 format_bytes(saved_file_bytes as usize),
+                                     pct_saved
+                        );
                     }
+
+                    total_orig_bytes += orig_file_size;
+                    total_new_bytes += actual_size;
+                    total_processed_files += 1;
+
                     if is_in_place && !cli.backup {
                         let _ = fs::remove_file(&old_path);
                     }
@@ -1828,5 +1949,24 @@ fn main() {
                 }
             }
         }
+    }
+
+    if !cli.quiet && total_processed_files > 0 {
+        let total_saved_bytes = total_orig_bytes.saturating_sub(total_new_bytes);
+        let total_pct_saved = if total_orig_bytes > 0 {
+            (total_saved_bytes as f64 / total_orig_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!("SUMMARY OF PROCESSED FILES");
+        println!("  Files processed ..... : {}", total_processed_files);
+        println!("  Total original size . : {} bytes ({})", total_orig_bytes, format_bytes(total_orig_bytes as usize));
+        println!("  Total new size ...... : {} bytes ({})", total_new_bytes, format_bytes(total_new_bytes as usize));
+        println!(
+            "  Total size decrease . : {} bytes ({}) ({:.2}%)",
+                 total_saved_bytes,
+                 format_bytes(total_saved_bytes as usize),
+                     total_pct_saved
+        );
     }
 }
