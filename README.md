@@ -82,6 +82,37 @@ GENERAL OPTIONS:
 
 OPTIMIZATION OPTIONS:
   -o <level>         Optimization level 0-7 (default: 2)
+  -zi <1|2>          Encoder implementation: 1 = zlib (default), 2 = Zöpfli (SLOW!!!)
+                        Zöpfli only supports the parameters -zc and -f, and
+                        the compression level is mapped to Zöpfli's number of
+                        iterations as follows (level => itrerations):
+                            1 => 1
+                            2 => 3
+                            3 => 5
+                            4 => 10
+                            5 => 15   Zöpfli default
+                            6 => 30
+                            7 => 50 
+                            8 => 100
+                            9 => 500  Maximum squeeze
+
+                        Optimization preset levels (-o) are as follows:
+                            -o0 => unchanged, no IDAT re-encoding
+                            -o1 => -zc1 -f3
+                            -o2 => -zc2 -f5
+                            -o3 => -zc3 -f5
+                            -o4 => -zc4 -f5
+                            -o5 => -zc5 -f5
+                            -o6 => -zc6 -f5
+                            -o7 => -zc7 -f3,5
+
+                        Memory usage: Trial results will remain in memory and Zöpfli
+                        needs random access to the data. The image data is also
+                        in memory as often as you have trials plus the raw pixels
+                        from the original file. Data is freed from memory as soon
+                        as it isn't needed anymore, though the peak memory will be
+                        as explained above + runtime and Zöpfli overhead.
+
   -zc <levels>       zlib compression levels (e.g., -zc1-9 or -zc9)
   -zm <levels>       zlib memory levels (e.g., -zm1-9 or -zm8,9)
   -zs <strategies>   zlib compression strategies (e.g., -zs0-3)

@@ -571,6 +571,36 @@ GENERAL OPTIONS:
 OPTIMIZATION OPTIONS:
   -o <level>         Optimization level 0-7 (default: 2)
   -zi <1|2>          Encoder implementation: 1 = zlib (default), 2 = Zöpfli (SLOW!!!)
+                        Zöpfli only supports the parameters -zc and -f, and
+                        the compression level is mapped to Zöpfli's number of
+                        iterations as follows (level => itrerations):
+                            1 => 1
+                            2 => 3
+                            3 => 5
+                            4 => 10
+                            5 => 15   Zöpfli default
+                            6 => 30
+                            7 => 50
+                            8 => 100
+                            9 => 500  Maximum squeeze
+
+                        Optimization preset levels (-o) are as follows:
+                            -o0 => unchanged, no IDAT re-encoding
+                            -o1 => -zc1 -f3
+                            -o2 => -zc2 -f5
+                            -o3 => -zc3 -f5
+                            -o4 => -zc4 -f5
+                            -o5 => -zc5 -f5
+                            -o6 => -zc6 -f5
+                            -o7 => -zc7 -f3,5
+
+                        Memory usage: Trial results will remain in memory and Zöpfli
+                        needs random access to the data. The image data is also
+                        in memory as often as you have trials plus the raw pixels
+                        from the original file. Data is freed from memory as soon
+                        as it isn't needed anymore, though the peak memory will be
+                        as explained above + runtime and Zöpfli overhead.
+
   -zc <levels>       zlib compression levels (e.g., -zc1-9 or -zc9)
   -zm <levels>       zlib memory levels (e.g., -zm1-9 or -zm8,9)
   -zs <strategies>   zlib compression strategies (e.g., -zs0-3)
@@ -1043,6 +1073,17 @@ fn zs_difficulty(zs: i32) -> u8 {
         3 => 1, // RLE (Easiest)
         _ => 0,
     }
+}
+
+type PngWriteCallback = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> usize;
+
+unsafe extern "C" fn buffer_write_cb(user_data: *mut c_void, buf: *const u8, len: usize) -> usize {
+    if !user_data.is_null() && !buf.is_null() {
+        let vec = unsafe { &mut *(user_data as *mut Vec<u8>) };
+        let slice = unsafe { std::slice::from_raw_parts(buf, len) };
+        vec.extend_from_slice(slice);
+    }
+    len
 }
 
 // =========================================================================
@@ -1542,7 +1583,7 @@ fn main() {
             );
         }
 
-        let image_data = Arc::new(raw_pixels);
+        let mut image_data = Some(Arc::new(raw_pixels));
 
         // --- Generate trials for this image using heuristics ---
         let (zc_list, zm_list, zs_list, f_list) = if cli.zi == 2 {
@@ -1572,6 +1613,7 @@ fn main() {
 
         let mut global_best_config: Option<TrialConfig> = None;
         let mut global_best_size: usize = usize::MAX;
+        let mut global_best_bytes: Option<Vec<u8>> = None;
         let total_trials: usize;
 
         if cli.nz {
@@ -1611,23 +1653,26 @@ fn main() {
                 println!("  Starting Trials ..... : {} trials, with {} parallel threads", total_trials, cli.mt);
             }
 
-            // 3. Parallel encoding trials (Dynamic Work Stealing Queue)
+            // Parallel encoding trials
             let mut handles = Vec::new();
-
             let next_trial_index = Arc::new(AtomicUsize::new(0));
             let completed_trials = Arc::new(AtomicUsize::new(0));
             let completed_scanlines = Arc::new(AtomicUsize::new(0));
             let stdout_lock = Arc::new(std::sync::Mutex::new(()));
 
             let total_rows = height as usize;
-            let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
+            let row_bytes = if total_rows > 0 { image_data.as_ref().unwrap().len() / total_rows } else { 0 };
             let total_scanlines = total_trials * total_rows;
+
+            let cmd_options = cli.cmd_options.clone();
+            let opt_level = cli.opt_level;
+            let is_zopfli = cli.zi == 2;
 
             let start_trials = Instant::now();
 
             for _ in 0..cli.mt {
                 let trials_clone = Arc::clone(&trials);
-                let img = Arc::clone(&image_data);
+                let image_data_ref = Arc::clone(image_data.as_ref().unwrap());
                 let palette_clone = shared_palette.clone();
                 let trns_clone = shared_trns.clone();
                 let next_idx = Arc::clone(&next_trial_index);
@@ -1635,10 +1680,12 @@ fn main() {
                 let scanlines_acc = Arc::clone(&completed_scanlines);
                 let lock = Arc::clone(&stdout_lock);
                 let quiet = cli.quiet;
+                let cmd_opts = cmd_options.clone();
 
                 handles.push(thread::spawn(move || {
                     let mut best_size = usize::MAX;
                     let mut best_config = None;
+                    let mut best_png_bytes: Option<Vec<u8>> = None;
                     let chunk_rows = 250;
 
                     loop {
@@ -1648,8 +1695,10 @@ fn main() {
                         }
 
                         let trial = &trials_clone[idx];
+                        let mut trial_output_buffer = Vec::new();
                         let mut dummy_written: usize = 0;
-                        let z_level = if cli.zi == 2 {
+
+                        let z_level = if is_zopfli {
                             zc_to_zopfli_iterations(trial.zc)
                         } else {
                             trial.zc
@@ -1665,20 +1714,55 @@ fn main() {
                             expected_idat_size: 0,
                         };
 
-                        // Derive pointers for palette
                         let (pal_ptr, pal_len) = match &palette_clone {
                             Some(pal) => (pal.as_ptr(), pal.len()),
-                            None => (std::ptr::null(), 0),
+                                           None => (std::ptr::null(), 0),
                         };
 
                         let (trns_ptr, trns_len) = match &trns_clone {
                             Some(trns) => (trns.as_ptr(), trns.len()),
-                            None => (std::ptr::null(), 0),
+                                           None => (std::ptr::null(), 0),
+                        };
+
+                        // Prepare metadata chunk for Zöpfli buffer retention
+                        let opt_info = if opt_level == 0 {
+                            "-o0".to_string()
+                        } else if cmd_opts.is_empty() && cli.zi == 1 {
+                            format!("{}{}{}{}", trial.zc, trial.zm, trial.zs, trial.f)
+                        } else if !cmd_opts.is_empty() && cli.zi == 1 {
+                            format!("{}\n{}{}{}{}", cmd_opts, trial.zc, trial.zm, trial.zs, trial.f)
+                        } else if !cmd_opts.is_empty() && cli.zi == 2 {
+                            format!("{}\n{}{}", cmd_opts, trial.zc, trial.f)
+                        } else {
+                            "".to_string()
+                        };
+
+                        let c_key = CString::new("optipng-rs").unwrap();
+                        let c_val = CString::new(opt_info).unwrap();
+                        let text_keys = [c_key.as_ptr()];
+                        let text_vals = [c_val.as_ptr()];
+
+                        let (write_cb_fn, user_data_ptr, text_k_ptr, text_v_ptr, text_cnt) = if is_zopfli {
+                            (
+                                buffer_write_cb as PngWriteCallback,
+                             &mut trial_output_buffer as *mut _ as *mut c_void,
+                             text_keys.as_ptr(),
+                             text_vals.as_ptr(),
+                             1usize,
+                            )
+                        } else {
+                            (
+                                counter_write_cb as PngWriteCallback,
+                             &mut dummy_written as *mut _ as *mut c_void,
+                             std::ptr::null(),
+                             std::ptr::null(),
+                             0usize,
+                            )
                         };
 
                         let enc = open_png_encode_stream(
-                            counter_write_cb,
-                            &mut dummy_written as *mut _ as *mut c_void,
+                            write_cb_fn,
+                            user_data_ptr,
                             width,
                             height,
                             out_bit_depth,
@@ -1688,30 +1772,33 @@ fn main() {
                             pal_len,
                             trns_ptr,
                             trns_len,
-                            std::ptr::null(),
-                            std::ptr::null(),
-                            0,
+                            text_k_ptr,
+                            text_v_ptr,
+                            text_cnt,
                             options,
                         );
 
                         if !enc.is_null() {
                             let mut encoded_rows = 0usize;
-                            while encoded_rows < total_rows {
-                                let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
-                                let offset = encoded_rows * row_bytes;
-                                let ptr = unsafe { img.as_ptr().add(offset) };
+                            {
+                                let img = Arc::clone(&image_data_ref);
+                                while encoded_rows < total_rows {
+                                    let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
+                                    let offset = encoded_rows * row_bytes;
+                                    let ptr = unsafe { img.as_ptr().add(offset) };
 
-                                encode_scanlines(enc, ptr, rows_to_encode as u32);
-                                encoded_rows += rows_to_encode;
+                                    encode_scanlines(enc, ptr, rows_to_encode as u32);
+                                    encoded_rows += rows_to_encode;
 
-                                let cur_scanlines = scanlines_acc.fetch_add(rows_to_encode, Ordering::Relaxed) + rows_to_encode;
-
-                                if !quiet && total_scanlines > 0 {
-                                    let done = completed.load(Ordering::Relaxed);
-                                    let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
-                                    if let Ok(_guard) = lock.try_lock() {
-                                        print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
-                                        let _ = io::stdout().flush();
+                                    // Report percentage only for zlib; display trial count for Zöpfli
+                                    if !quiet && !is_zopfli && total_scanlines > 0 {
+                                        let cur_scanlines = scanlines_acc.fetch_add(rows_to_encode, Ordering::Relaxed) + rows_to_encode;
+                                        let done = completed.load(Ordering::Relaxed);
+                                        let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
+                                        if let Ok(_guard) = lock.try_lock() {
+                                            print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
+                                            let _ = io::stdout().flush();
+                                        }
                                     }
                                 }
                             }
@@ -1721,28 +1808,45 @@ fn main() {
                             if encoded_rows == total_rows && trial_idat_size < best_size && trial_idat_size > 0 {
                                 best_size = trial_idat_size;
                                 best_config = Some(trial.clone());
+                                if is_zopfli {
+                                    best_png_bytes = Some(trial_output_buffer);
+                                }
                             }
                         }
 
                         let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                        if !quiet && total_scanlines > 0 {
-                            let cur_scanlines = scanlines_acc.load(Ordering::Relaxed);
-                            let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
-                            if let Ok(_guard) = lock.try_lock() {
-                                print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
-                                let _ = io::stdout().flush();
+                        if !quiet {
+                            if is_zopfli {
+                                if let Ok(_guard) = lock.try_lock() {
+                                    print!("\r  Trial progress ...... : {}/{} trials completed", done, total_trials);
+                                    let _ = io::stdout().flush();
+                                }
+                            } else if total_scanlines > 0 {
+                                let cur_scanlines = scanlines_acc.load(Ordering::Relaxed);
+                                let progress_pct = ((cur_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0);
+                                if let Ok(_guard) = lock.try_lock() {
+                                    print!("\r  Trial progress ...... : {:.2} percent, {} trials done", progress_pct, done);
+                                    let _ = io::stdout().flush();
+                                }
                             }
                         }
                     }
-                    (best_size, best_config)
+                    (best_size, best_config, best_png_bytes)
                 }));
             }
 
+            if cli.zi == 2 {
+                image_data = None;
+            }
+
             for handle in handles {
-                if let Ok((size, Some(config))) = handle.join() {
+                if let Ok((size, Some(config), maybe_bytes)) = handle.join() {
                     if size < global_best_size {
                         global_best_size = size;
                         global_best_config = Some(config);
+                        if is_zopfli {
+                            global_best_bytes = maybe_bytes;
+                        }
                     }
                 }
             }
@@ -1756,29 +1860,40 @@ fn main() {
         // 4. Final Output Write
         if let Some(best) = global_best_config {
             if !cli.quiet {
-                if total_trials > 1 {
+                if total_trials > 1 && cli.zi == 1 {
                     println!(
                         "  Best parameters ..... : -zc{} -zm{} -zs{} -f{}",
                         best.zc, best.zm, best.zs, best.f,
                     );
-                } else if !cli.nz {
+                } else if !cli.nz && cli.zi == 1 {
                     println!(
                         "  Used parameters ..... : -zc{} -zm{} -zs{} -f{}",
                         best.zc, best.zm, best.zs, best.f,
                     );
+                } else if total_trials > 1 && cli.zi == 2 {
+                    println!(
+                        "  Best parameters ..... : -zc{} -f{}",
+                        best.zc, best.f,
+                    );
+                } else if !cli.nz && cli.zi == 2 {
+                    println!(
+                        "  Used parameters ..... : -zc{} -f{}",
+                        best.zc, best.f,
+                    );
                 }
+
                 if !cli.nz {
                     println!(
                         "  New image data size . : {} bytes ({})\n  vs original ......... : {} bytes ({})",
-                            global_best_size,
-                            format_bytes(global_best_size),
-                                orig_idat_size,
-                            format_bytes(orig_idat_size),
+                             global_best_size,
+                             format_bytes(global_best_size),
+                                 orig_idat_size,
+                             format_bytes(orig_idat_size),
                     );
                 }
             }
 
-            // Skip file modification if trial result is larger/equal (unless -force or -nz is specified)
+            // Skip file modification if trial result is larger/equal
             if !cli.force_reenc && !is_external && global_best_size >= orig_idat_size && !cli.nz {
                 if !cli.quiet {
                     println!("  /!\\ No compression improvement over source IDAT size. Skipping file write.");
@@ -1811,7 +1926,9 @@ fn main() {
                 }
 
                 let input_source = if is_in_place { &old_path } else { &original_path };
+                let mut success = false;
 
+                // Construct opt_info metadata before writing branches
                 let opt_info = if cli.opt_level == 0 {
                     "-o0".to_string()
                 } else if cli.cmd_options.is_empty() {
@@ -1820,10 +1937,18 @@ fn main() {
                     format!("{}\n{}{}{}{}", cli.cmd_options, best.zc, best.zm, best.zs, best.f)
                 };
 
-                let mut success = false;
-
-                if cli.nz && !is_external {
-                    // Fast Path (-o0 / -nz): Direct raw IDAT stream copy & chunk coalescing without zlib re-encoding
+                if let Some(winning_bytes) = global_best_bytes {
+                    // Direct Write Shortcut (-zi2 / Zöpfli): Write pre-compressed winning PNG directly
+                    match fs::write(&out_path, &winning_bytes) {
+                        Ok(_) => {
+                            success = out_path.exists();
+                        }
+                        Err(e) => {
+                            eprintln!("  (x) Failed to write optimal PNG buffer to disk: {}", e);
+                        }
+                    }
+                } else if cli.nz && !is_external {
+                    // Fast Path (-o0 / -nz): Direct raw IDAT stream copy
                     match copy_png_idat_and_add_text(input_source, &out_path, "optipng-rs", &opt_info) {
                         Ok(_) => {
                             success = out_path.exists();
@@ -1832,18 +1957,12 @@ fn main() {
                             eprintln!("  (x) Failed to copy IDAT and write text chunk: {}", e);
                         }
                     }
-                } else {
-                    // Standard Path: Full zlib re-encoding stream
+                } else if let Some(ref img_data) = image_data {
+                    // Standard Path (zlib): Full zlib re-encoding stream
                     let c_out_path = CString::new(out_path.to_string_lossy().into_owned()).unwrap();
-                    let z_level = if cli.zi == 2 {
-                        zc_to_zopfli_iterations(best.zc)
-                    } else {
-                        best.zc
-                    };
-
                     let final_options = ZlibOptions {
                         z_implementation: cli.zi,
-                        level: z_level,
+                        level: best.zc,
                         strategy: best.zs,
                         window_bits: 15,
                         mem_level: best.zm,
@@ -1868,31 +1987,31 @@ fn main() {
 
                     let enc = open_png_encode(
                         c_out_path.as_ptr(),
-                                              width,
-                                              height,
-                                              out_bit_depth,
-                                              out_color_type,
-                                              best.f,
-                                              pal_ptr,
-                                              pal_len,
-                                              trns_ptr,
-                                              trns_len,
-                                              text_keys.as_ptr(),
-                                              text_vals.as_ptr(),
-                                              1,
-                                              final_options,
+                        width,
+                        height,
+                        out_bit_depth,
+                        out_color_type,
+                        best.f,
+                        pal_ptr,
+                        pal_len,
+                        trns_ptr,
+                        trns_len,
+                        text_keys.as_ptr(),
+                        text_vals.as_ptr(),
+                        1,
+                        final_options,
                     );
 
                     if !enc.is_null() {
                         let total_rows = height as usize;
-                        let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
+                        let row_bytes = if total_rows > 0 { img_data.len() / total_rows } else { 0 };
                         let mut encoded_rows = 0usize;
                         let chunk_rows = 250;
 
                         while encoded_rows < total_rows {
                             let rows_to_encode = (total_rows - encoded_rows).min(chunk_rows);
                             let offset = encoded_rows * row_bytes;
-                            let ptr = unsafe { image_data.as_ptr().add(offset) };
+                            let ptr = unsafe { img_data.as_ptr().add(offset) };
 
                             encode_scanlines(enc, ptr, rows_to_encode as u32);
                             encoded_rows += rows_to_encode;
