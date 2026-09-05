@@ -6,9 +6,7 @@ edition = "2024"
 [dependencies]
 decoder = { path = "../png_stream_dec/decoder" }
 encoder = { path = "../png_stream_enc/encoder" }
-clap = { version = "4.0", features = ["derive"] }
 owo-colors = "4.0"
-libc = "0.2"
 
 [[bin]]
 name = "optipng-rs"
