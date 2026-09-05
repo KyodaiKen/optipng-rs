@@ -1,0 +1,17 @@
+{
+  "name": "optipng-rs",
+  "files": [ { "git": true } ],
+  "lspclient": {
+    "servers": {
+      "rust": {
+        "command": ["podman", "exec", "-i", "devenv", "rust-analyzer"],
+        "highlightingModeRegex": "^Rust$",
+        "initializationOptions": {
+          "files": {
+            "watcher": "client"
+          }
+        }
+      }
+    }
+  }
+}
