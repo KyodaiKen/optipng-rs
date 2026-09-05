@@ -21,7 +21,7 @@ use pngstreamenc::{
     close_png_encode, encode_scanlines, open_png_encode, ZlibOptions,
 };
 
-use crate::models::TrialConfig;
+use crate::models::{TrialConfig, ReductionResult};
 use crate::cli::*;
 use crate::utils::*;
 use crate::decoders::*;
@@ -194,10 +194,7 @@ fn main() {
             );
         }
 
-        // =========================================================================
-        // STEP 2: OPTIPNG COLOR & BIT-DEPTH REDUCTION PIPELINE
-        // =========================================================================
-
+        // Reduce colors losslessly
         let ReductionResult {
             out_color_type,
             out_bit_depth,

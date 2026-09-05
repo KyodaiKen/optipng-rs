@@ -45,3 +45,10 @@ pub struct LoadedImage {
     pub raw_pixels: Vec<u8>,
     pub orig_idat_size: usize,
 }
+
+pub struct ReductionResult {
+    pub out_color_type: u8,
+    pub out_bit_depth: u8,
+    pub final_palette: Option<Vec<u8>>,
+    pub final_trns: Option<Vec<u8>>,
+}

@@ -4,14 +4,8 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::models::CliArgs;
+use crate::models::ReductionResult;
 use crate::utils::color_type_name;
-
-pub struct ReductionResult {
-    pub out_color_type: u8,
-    pub out_bit_depth: u8,
-    pub final_palette: Option<Vec<u8>>,
-    pub final_trns: Option<Vec<u8>>,
-}
 
 pub fn reduce_image(
     cli: &CliArgs,
