@@ -1,6 +1,6 @@
 /***************************************************
-* optipng-rs: Command-line parsing and definitions *
-*************************************************+*/
+ * optipng-rs: Command-line parsing and definitions *
+ *************************************************+*/
 
 use crate::models::CliArgs;
 use crate::utils::{parse_ranges_i32, parse_ranges_u8};
@@ -27,7 +27,8 @@ pub fn parse_args() -> CliArgs {
         nx: false,
         nz: false,
         out_file: None,
-        out_dir: None,
+        recursive: false,
+        max_depth: None,
         show_help: false,
         force_trials: false,
             force_reenc: false,
@@ -69,13 +70,23 @@ pub fn parse_args() -> CliArgs {
             continue;
         }
 
-        if arg == "-dir" {
+        if arg == "-R" {
+            cli.recursive = true;
             opt_tokens.push(arg.clone());
             i += 1;
-            if i < raw_args.len() {
-                cli.out_dir = Some(raw_args[i].clone());
+            if i < raw_args.len() && raw_args[i].chars().all(|c| c.is_ascii_digit()) {
+                cli.max_depth = raw_args[i].parse::<usize>().ok();
+                opt_tokens.push(raw_args[i].clone());
                 i += 1;
             }
+            continue;
+        }
+
+        if arg.starts_with("-R") && arg.len() > 2 && arg[2..].chars().all(|c| c.is_ascii_digit()) {
+            cli.recursive = true;
+            cli.max_depth = arg[2..].parse::<usize>().ok();
+            opt_tokens.push(arg.clone());
+            i += 1;
             continue;
         }
 
@@ -274,7 +285,6 @@ pub fn parse_args() -> CliArgs {
         }
     }
 
-    // Implement level 0
     if cli.opt_level == 0 {
         cli.nx = true;
         cli.nz = true;
@@ -299,73 +309,32 @@ pub fn print_usage() {
     println!(
         r#"optipng-rs v{version} - High-performance parallel PNG optimizer and converter
 
-USAGE:
-optipng-rs [options] <file1.png> [file2.png ...]
-optipng-rs [options] -e <input_file> [output.png]
+        USAGE:
+        optipng-rs [options] <file1.png> [file2.png ...]
+        optipng-rs [options] . [-R[depth]]
+        optipng-rs [options] -e <input_file> [output.png]
 
-GENERAL OPTIONS:
--h, --help         Print this help message
--quiet, -silent    Quiet mode (suppress non-error output)
--mt <threads>      Number of worker threads (default: 75% of CPUs)
--backup, -keep     Keep a backup copy of original files (.bak)
--simulate          Simulation mode (run trials only, skip writing files)
--force             Force file write even if compressed size increases
--ft                Force trials even if file was previously optimized
+        GENERAL OPTIONS:
+        -h, --help         Print this help message
+        -quiet, -silent    Quiet mode (suppress non-error output)
+    -mt <threads>      Number of worker threads (default: 75% of CPUs)
+    -R[N], -R [N]      Recursively scan directories for *.png files (N = max depth)
+    -backup, -keep     Keep a backup copy of original files (.bak)
+    -simulate          Simulation mode (run trials only, skip writing files)
+    -force             Force file write even if compressed size increases
+    -ft                Force trials even if file was previously optimized
 
-OPTIMIZATION OPTIONS:
--o <level>         Optimization level 0-7 (default: 2)
--zi <1|2>          Encoder implementation: 1 = zlib (default), 2 = Zöpfli (SLOW!!!)
-Zöpfli only supports the parameters -zc and -f, and
-the compression level is mapped to Zöpfli's number of
-iterations as follows (level => itrerations):
-1 => 1
-2 => 3
-3 => 5
-4 => 10
-5 => 15   Zöpfli default
-6 => 30
-7 => 50
-8 => 100
-9 => 500  Maximum squeeze
+    OPTIMIZATION OPTIONS:
+    -o <level>         Optimization level 0-7 (default: 2)
+    -zi <1|2>          Encoder implementation: 1 = zlib (default), 2 = Zöpfli
+    -zc <levels>       zlib compression levels (e.g., -zc1-9)
+    -zm <levels>       zlib memory levels (e.g., -zm1-9)
+    -zs <strategies>   zlib compression strategies (e.g., -zs0-3)
+    -f <filters>       PNG delta filter algorithms (e.g., -f0,5)
+    -nz                No IDAT recoding (fast path / zero re-compression)
 
-Optimization preset levels (-o) are as follows:
--o0 => unchanged, no IDAT re-encoding
--o1 => -zc1 -f3
--o2 => -zc2 -f5
--o3 => -zc3 -f5
--o4 => -zc4 -f5
--o5 => -zc5 -f5
--o6 => -zc6 -f5
--o7 => -zc7 -f3,5
-
-Memory usage: Trial results will remain in memory and Zöpfli
-needs random access to the data. The image data is also
-in memory as often as you have trials plus the raw pixels
-from the original file. Data is freed from memory as soon
-as it isn't needed anymore, though the peak memory will be
-as explained above + runtime and Zöpfli overhead.
-
--zc <levels>       zlib compression levels (e.g., -zc1-9 or -zc9)
--zm <levels>       zlib memory levels (e.g., -zm1-9 or -zm8,9)
--zs <strategies>   zlib compression strategies (e.g., -zs0-3)
--f <filters>       PNG delta filter algorithms (e.g., -f0,5 or -f0-5)
--nz                No IDAT recoding (fast path / zero re-compression)
-
-IMAGE REDUCTION OPTIONS:
--nb                Disable bit depth reduction
--nc                Disable color type reduction
--np                Disable palette reduction
--nx                Disable all image reductions (-nb, -nc, -np)
-
-INPUT / OUTPUT OPTIONS:
--e <file>          External input file format (TGA, PPM, PGM, PAM) to encode
--out <file>        Output file path
--dir <directory>   Output directory
-
-METADATA & DEDUPLICATION:
-* All non-essential PNG metadata is stripped during optimization.
-* A 'tEXt' chunk with key 'optipng-rs' is injected to track optimization state:
-- Line 1: User-specified command options (if present).
-- Line 2: Winning trial settings (-zc -zm -zs -f) or '-o0'."#
+    INPUT / OUTPUT OPTIONS:
+    -e <file>          External input file format (TGA, PPM, PGM, PAM)
+    -out <path>        Output file path (single file) or output directory (multi-file)"#
     );
 }

@@ -2,6 +2,8 @@
 * optipng-rs: Shared data structures *
 ************************************+*/
 
+use std::path::PathBuf;
+
 #[derive(Debug, Clone)]
 pub struct TrialConfig {
     pub zc: i32,
@@ -29,11 +31,19 @@ pub struct CliArgs {
     pub nx: bool,
     pub nz: bool,
     pub out_file: Option<String>,
-    pub out_dir: Option<String>,
+    pub recursive: bool,
+    pub max_depth: Option<usize>,
     pub show_help: bool,
     pub force_trials: bool,
     pub force_reenc: bool,
     pub cmd_options: String,
+}
+
+pub struct FileTask {
+    pub in_path: PathBuf,
+    pub out_path: PathBuf,
+    pub is_external: bool,
+    pub orig_size: u64,
 }
 
 pub struct LoadedImage {
