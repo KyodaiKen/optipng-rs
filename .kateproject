@@ -11,6 +11,10 @@
             "watcher": "client"
           }
         }
+      },
+      "markdown": {
+        "command": ["podman", "exec", "-i", "devenv", "marksman", "server"],
+        "highlightingModeRegex": "^Markdown$"
       }
     }
   }
