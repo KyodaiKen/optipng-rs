@@ -334,10 +334,10 @@ impl Scheduler {
         let extra_str = format!("{} ({:.1}%)", format_bytes(savings_bytes as usize), savings_pct);
         let extra = format!("{:>width$}", extra_str, width = pct_w);
 
-        let template = format!("{{spinner:.cyan.bold}} {{msg}} [{{bar:{bar_w}.cyan.bold/cyan}}] {extra}");
+        let template = format!("{{spinner:.cyan.bold}} {{msg}} {{bar:{bar_w}.cyan.bold/cyan}} {extra}");
         let style = indicatif::ProgressStyle::with_template(&template)
         .unwrap()
-        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        .tick_chars(".oOo.")
         .progress_chars("█▉▊▋▌▍▎▏ ");
 
         pb.set_style(style);
@@ -679,10 +679,10 @@ fn main() {
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
         let term_w = get_terminal_width();
         let bar_w = term_w.saturating_sub(12).max(10);
-        let template = format!("{{spinner:.dim}} {{msg}} [{{bar:{bar_w}.cyan.bold/cyan}}]");
+        let template = format!("{{spinner:.dim}} {{msg}} {{bar:{bar_w}.cyan.bold/cyan}}");
         let style = indicatif::ProgressStyle::with_template(&template)
         .unwrap()
-        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        .tick_chars(".oOo.")
         .progress_chars("█▉▊▋▌▍▎▏ ");
         pb.set_style(style);
         pb.set_message(format!("{:>6}", 0));
