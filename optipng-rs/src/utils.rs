@@ -141,6 +141,12 @@ pub fn format_duration(duration: Duration) -> String {
     }
 }
 
+/// Formats error messages with a bright red cross symbol for UI consistency.
+pub fn format_error(msg: &str) -> String {
+    let error_mark = console::style("✖").red().bright();
+    format!("{} {}", error_mark, msg)
+}
+
 // CALLBACKS
 pub type PngWriteCallback = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> usize;
 

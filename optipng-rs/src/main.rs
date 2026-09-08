@@ -658,9 +658,10 @@ fn main() {
         std::process::exit(0);
     }
 
+    // Missing input files
     if cli.files.is_empty() && cli.external_input.is_none() {
         if !cli.quiet {
-            eprintln!("optipng-rs: Error: No input files specified.\n");
+            eprintln!("{}\n", format_error("Error: No input files specified."));
             print_usage();
         }
         std::process::exit(1);
@@ -675,6 +676,7 @@ fn main() {
     // Initialize evaluation progress bar (gray spinner, file number column, cyan bar in brackets)
     let scan_pb = if !cli.quiet {
         let pb = indicatif::ProgressBar::new_spinner();
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
         let term_w = get_terminal_width();
         let bar_w = term_w.saturating_sub(12).max(10);
         let template = format!("{{spinner:.dim}} {{msg}} [{{bar:{bar_w}.cyan.bold/cyan}}]");
@@ -703,7 +705,7 @@ fn main() {
             }
         } else {
             stats.non_pngs += 1;
-            eprintln!("Error: '{}' is not a valid PNG file", ext_in);
+            eprintln!("{}", format_error(&format!("'{}' is not a valid PNG file", ext_in)));
         }
     } else {
         let mut found_files = Vec::new();
@@ -800,7 +802,7 @@ fn main() {
             let out_p = PathBuf::from(out_arg);
             if is_multi_file || out_p.is_dir() || out_arg.ends_with('/') || out_arg.ends_with('\\') {
                 if let Err(e) = fs::create_dir_all(&out_p) {
-                    eprintln!("Failed to create output directory {:?}: {}", out_p, e);
+                    eprintln!("{}", format_error(&format!("Failed to create output directory {:?}: {}", out_p, e)));
                     std::process::exit(1);
                 }
                 out_p.join(in_path.file_name().unwrap_or_default())
@@ -876,8 +878,12 @@ fn main() {
 
     // Initialize single overall progress bar for all threads
     let overall_pb = multi_progress
-    .as_ref()
-    .map(|mp| mp.add(indicatif::ProgressBar::new(10000)));
+        .as_ref()
+        .map(|mp| {
+            let pb = mp.add(indicatif::ProgressBar::new(10000));
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            pb
+        });
 
     let mut scheduler_inner = Scheduler {
         files: file_states,
@@ -1008,8 +1014,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
                             if has_error {
                                 let err = lock.files[next_idx].error_msg.as_ref().unwrap();
                                 if let Some(ref mp_handle) = mp {
-                                    let x_mark = console::style("✗").red().bright();
-                                    let _ = mp_handle.println(format!("{} {} - Error: {}", x_mark, rel_path, err));
+                                    let _ = mp_handle.println(format_error(&format!("{} - Error: {}", rel_path, err)));
                                 }
 
                                 lock.finished_files += 1;
@@ -1225,7 +1230,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
             0.0
         };
 
-        println!("SUMMARY OF PROCESSED FILES");
+        println!("\nSUMMARY OF PROCESSED FILES");
         println!("  Files processed ..... : {}", final_sched.finished_files);
         println!("  Total original size . : {} bytes ({})", total_orig, format_bytes(total_orig as usize));
         println!("  Total new size ...... : {} bytes ({})", total_new, format_bytes(total_new as usize));
