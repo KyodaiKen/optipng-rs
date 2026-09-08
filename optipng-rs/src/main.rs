@@ -1,6 +1,6 @@
 /***************************************************************
-* optipng-rs: Main multi-threaded execution and progress UI   *
-***************************************************************/
+ * optipng-rs: Main multi-threaded execution and progress UI   *
+ ***************************************************************/
 
 mod models;
 mod utils;
@@ -11,9 +11,9 @@ mod trials;
 mod reduction;
 
 use std::collections::HashSet;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -21,8 +21,7 @@ use std::time::Instant;
 use sysinfo::System;
 
 use pngstreamdec::{
-    close_png, decode_scanlines, free_text_data, open_png, png_get_idat_size,
-    png_get_text_count, png_get_text_data, png_set_count_idat_size,
+    close_png, decode_scanlines, open_png, png_get_idat_size, png_set_count_idat_size,
 };
 use pngstreamenc::{close_png_encode, encode_scanlines, open_png_encode, ZlibOptions};
 
@@ -34,15 +33,79 @@ use crate::reduction::*;
 use crate::trials::*;
 use crate::utils::*;
 
-/* Recursively scans directories to collect target PNG files without cyclic loops. */
+/// Validates PNG magic bytes and checks if the file was already optimized by optipng-rs.
+/// Returns `(is_valid_png, is_already_optimized)`.
+fn check_png_file(path: &Path, force_trials: bool) -> (bool, bool) {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return (false, false),
+    };
+
+    let mut header = [0u8; 8];
+    if file.read_exact(&mut header).is_err() {
+        return (false, false);
+    }
+
+    // Verify 8-byte PNG magic number
+    if header != *b"\x89PNG\r\n\x1a\n" {
+        return (false, false);
+    }
+
+    if force_trials {
+        return (true, false);
+    }
+
+    let mut length_buf = [0u8; 4];
+    let mut type_buf = [0u8; 4];
+
+    while file.read_exact(&mut length_buf).is_ok() && file.read_exact(&mut type_buf).is_ok() {
+        let len = u32::from_be_bytes(length_buf) as u64;
+        if &type_buf == b"tEXt" {
+            let mut data = vec![0u8; len as usize];
+            if file.read_exact(&mut data).is_ok() {
+                if let Some(null_pos) = data.iter().position(|&b| b == 0) {
+                    if let Ok(kw) = std::str::from_utf8(&data[..null_pos]) {
+                        if kw == "optipng-rs" {
+                            return (true, true);
+                        }
+                    }
+                }
+            }
+            let _ = file.seek(io::SeekFrom::Current(4)); // Skip CRC
+        } else if &type_buf == b"IEND" {
+            break;
+        } else {
+            let _ = file.seek(io::SeekFrom::Current((len + 4) as i64));
+        }
+    }
+
+    (true, false)
+}
+
+/// Tracks file metrics discovered during directory and path scanning.
+#[derive(Default, Debug)]
+struct ScanStats {
+    /// Count of valid PNG files discovered.
+    valid_pngs: usize,
+    /// Count of valid PNG files that were skipped because they are already optimized.
+    already_optimized: usize,
+    /// Count of non-PNG files or corrupted/invalid PNG files encountered.
+    non_pngs: usize,
+}
+
+/// Recursively scans directories to collect valid target PNG files, tracking file statistics.
 fn scan_directory(
     dir: &Path,
     current_depth: usize,
     max_depth: Option<usize>,
     recursive: bool,
-    visited_dirs: &mut HashSet<PathBuf>,
-    visited_files: &mut HashSet<PathBuf>,
-    found_files: &mut Vec<PathBuf>,
+    force_trials: bool,
+        base_dir: &Path,
+        visited_dirs: &mut HashSet<PathBuf>,
+        visited_files: &mut HashSet<PathBuf>,
+        found_files: &mut Vec<PathBuf>,
+        scan_pb: Option<&indicatif::ProgressBar>,
+        stats: &mut ScanStats,
 ) -> io::Result<()> {
     let canonical_dir = match fs::canonicalize(dir) {
         Ok(p) => p,
@@ -53,8 +116,16 @@ fn scan_directory(
         return Ok(());
     }
 
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
         let path = entry.path();
 
         let meta = match fs::metadata(&path) {
@@ -71,50 +142,95 @@ fn scan_directory(
                         next_depth,
                         max_depth,
                         recursive,
-                        visited_dirs,
-                        visited_files,
-                        found_files,
+                        force_trials,
+                            base_dir,
+                            visited_dirs,
+                            visited_files,
+                            found_files,
+                            scan_pb,
+                            stats,
                     )?;
                 }
             }
         } else if meta.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext.to_string_lossy().eq_ignore_ascii_case("png") {
-                    let canonical_file = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-                    if visited_files.insert(canonical_file) {
-                        found_files.push(path);
+            let is_png_ext = path
+            .extension()
+            .map_or(false, |ext| ext.to_string_lossy().eq_ignore_ascii_case("png"));
+
+            if is_png_ext {
+                let canonical_file = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                if visited_files.insert(canonical_file) {
+                    if let Some(pb) = scan_pb {
+                        pb.tick();
+                    }
+
+                    let rel_path = if recursive {
+                        path.strip_prefix(base_dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string()
+                    } else {
+                        path.file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.to_string_lossy().to_string())
+                    };
+
+                    let (is_valid, is_already_optimized) = check_png_file(&path, force_trials);
+
+                    if !is_valid {
+                        stats.non_pngs += 1;
+                        let error_mark = console::style("✖").red().bright();
+                        if let Some(pb) = scan_pb {
+                            pb.println(format!("{} {} is not a valid PNG file", error_mark, rel_path));
+                        } else {
+                            eprintln!("{} {} is not a valid PNG file", error_mark, rel_path);
+                        }
+                        continue;
+                    }
+
+                    stats.valid_pngs += 1;
+
+                    if is_already_optimized {
+                        stats.already_optimized += 1;
+                        if let Some(pb) = scan_pb {
+                            pb.println(format!("- {} -> skipped (already optimized)", rel_path));
+                        }
+                        continue;
+                    }
+
+                    found_files.push(path);
+                    if let Some(pb) = scan_pb {
+                        pb.set_message(format!("{:>6}", found_files.len()));
                     }
                 }
+            } else {
+                stats.non_pngs += 1;
             }
         }
     }
     Ok(())
 }
 
-/* Dynamically calculates column widths for Indicatif UI based on terminal width.
- * Returns (fn_width, trials_width, bar_width, pct_width) */
+/// Dynamically calculates column widths for Indicatif UI based on terminal width.
+/// Returns (fn_width, trials_width, bar_width, pct_width)
 fn calculate_column_widths(term_width: usize) -> (usize, usize, usize, usize) {
     let w = term_width.max(60);
     let fn_w = (w as f64 * 0.50) as usize;
     let trials_w = 20;
     let pct_w = 10;
 
-    // Fixed layout elements count towards non-bar width:
-    // Spinner (1) + Space (1) + Msg (fn_w) + Space (1) + Prefix (trials_w) + Space (1)
-    // + Bar Brackets "[]" (2) + Space (1) + Percent (pct_w) = fn_w + trials_w + pct_w + 7
     let fixed = 7;
     let used = fn_w + trials_w + pct_w + fixed;
     let bar_w = if w > used { w - used } else { 10 };
     (fn_w, trials_w, bar_w, pct_w)
 }
 
-/* Returns the current terminal column width, falling back to 80 if unavailable. */
+/// Returns the current terminal column width, falling back to 80 if unavailable.
 fn get_terminal_width() -> usize {
     console::Term::stdout().size().1 as usize
 }
 
-
-/* Formats applied reduction parameters and image reduction info for finished summary lines. */
+/// Formats applied reduction parameters and image reduction info for finished summary lines.
 fn format_reduction_info(state: &FileState, zi: u8) -> String {
     let mut parts = Vec::new();
 
@@ -160,149 +276,79 @@ fn format_reduction_info(state: &FileState, zi: u8) -> String {
     }
 }
 
-/// Converts the progress bar into a persistent summary line.
-///
-/// If the file is skipped, it prints the status above the active progress bars
-/// and clears the bar to prevent UI redraw issues. Otherwise, it finishes
-/// the progress bar in place with a winning indicator.
-///
-/// # Arguments
-///
-/// * `pb` - The active progress bar for the file.
-/// * `rel_path` - The relative path of the file.
-/// * `reduction_str` - Formatted reduction statistics.
-/// * `savings_str` - Formatted size savings or skipped reason.
-/// * `is_skipped` - Boolean flag indicating if the file was skipped.
-fn finish_file_pb(
-    pb: &indicatif::ProgressBar,
-    rel_path: &str,
-    reduction_str: &str,
-    savings_str: &str,
-    is_skipped: bool,
-) {
-    if is_skipped {
-        pb.println(format!("- {} -> {}", rel_path, savings_str));
-        pb.finish_and_clear();
-    } else {
-        let style = indicatif::ProgressStyle::with_template("{msg}").unwrap();
-        pb.set_style(style);
-        pb.finish_with_message(format!("✓ {} [{}] -> {}", rel_path, reduction_str, savings_str));
-    }
-}
-
-/* Formats and updates active file progress bars with Trial counts on the left of the bar and percentage on the right. */
-fn update_file_pb(
-    pb: &indicatif::ProgressBar,
-    rel_path: &str,
-    _zi: u8,
-    done_trials: usize,
-    total_trials: usize,
-    done_scanlines: usize,
-    total_scanlines: usize,
-    term_width: usize,
-) {
-    let (fn_w, trials_w, bar_w, pct_w) = calculate_column_widths(term_width);
-
-    let truncated_fn = truncate_middle(rel_path, fn_w);
-    let msg = format!("{:<width$}", truncated_fn, width = fn_w);
-
-    let trials_str = if total_trials > 0 {
-        format!("[{}/{}]", done_trials, total_trials)
-    } else {
-        "[prep...]".to_string()
-    };
-    let prefix = format!("{:>width$}", trials_str, width = trials_w);
-
-    let pct = if total_scanlines > 0 {
-        ((done_scanlines as f64 / total_scanlines as f64) * 100.0).min(100.0)
-    } else if total_trials > 0 {
-        ((done_trials as f64 / total_trials as f64) * 100.0).min(100.0)
-    } else {
-        0.0
-    };
-    let pct_str = format!("{:>width$}", format!("{:.1}%", pct), width = pct_w);
-
-    let template = format!("{{spinner:.yellow.bold}} {{msg}} [{{bar:{bar_w}.white/dim}}] {{prefix}} {pct_str}");
-    let style = indicatif::ProgressStyle::with_template(&template)
-    .unwrap()
-    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-    .progress_chars("█▉▊▋▌▍▎▏ ");
-
-    pb.set_style(style);
-    pb.set_message(msg);
-    pb.set_prefix(prefix);
-
-    let pos = if total_scanlines > 0 {
-        ((done_scanlines as f64 / total_scanlines as f64) * 10000.0) as u64
-    } else if total_trials > 0 {
-        ((done_trials as f64 / total_trials as f64) * 10000.0) as u64
-    } else {
-        0
-    };
-    pb.set_position(pos.min(10000));
-}
-
-/* Formats and updates bottom overall progress bar taking per-file progress into account. */
-fn update_overall_pb(
-    pb: &indicatif::ProgressBar,
-    files: &[FileState],
-    total_orig_bytes: u64,
-    total_new_bytes: u64,
-    term_width: usize,
-) {
-    let total_files = files.len();
-    if total_files == 0 {
-        pb.set_position(10000);
-        return;
-    }
-
-    let mut total_progress_units = 0.0f64;
-    let mut completed_files = 0usize;
-
-    for f in files {
-        if f.is_processed || f.is_skipped {
-            total_progress_units += 1.0;
-            completed_files += 1;
-        } else if f.total_scanlines > 0 {
-            let frac = (f.completed_scanlines as f64 / f.total_scanlines as f64).min(1.0);
-            total_progress_units += frac;
-        } else if f.total_trials > 0 {
-            let frac = (f.completed_trials as f64 / f.total_trials as f64).min(1.0);
-            total_progress_units += frac;
+impl Scheduler {
+    /// Formats and updates the single overall progress bar shared across all threads.
+    /// Throttles UI updates to a maximum of 10 Hz (100 ms) unless overall progress is complete.
+    fn update_overall_pb(&mut self, pb: &indicatif::ProgressBar, term_width: usize) {
+        let total_files = self.files.len();
+        if total_files == 0 {
+            pb.set_position(10000);
+            return;
         }
+
+        let mut total_progress_units = 0.0f64;
+        let mut completed_files = 0usize;
+
+        for f in &self.files {
+            if f.is_processed || f.is_skipped {
+                total_progress_units += 1.0;
+                completed_files += 1;
+            } else if f.total_scanlines > 0 {
+                let frac = (f.completed_scanlines as f64 / f.total_scanlines as f64).min(1.0);
+                total_progress_units += frac;
+            } else if f.total_trials > 0 {
+                let frac = (f.completed_trials as f64 / f.total_trials as f64).min(1.0);
+                total_progress_units += frac;
+            }
+        }
+
+        let overall_frac = total_progress_units / total_files as f64;
+
+        if overall_frac < 1.0 {
+            if let Some(last) = self.last_overall_pb_update {
+                if last.elapsed() < std::time::Duration::from_millis(100) {
+                    return;
+                }
+            }
+        }
+
+        self.last_overall_pb_update = Some(Instant::now());
+
+        let (fn_w, _, bar_w, pct_w) = calculate_column_widths(term_width);
+
+        let status_str = format!(
+            "Overall Progress: {}/{} {}",
+            completed_files,
+            total_files,
+            format!("{:.2}%", overall_frac * 100.0)
+        );
+        let truncated_status = truncate_middle(&status_str, fn_w);
+        let msg = format!("{:<width$}", truncated_status, width = fn_w);
+
+        let savings_bytes = self.total_orig_bytes.saturating_sub(self.total_new_bytes);
+        let savings_pct = if self.total_orig_bytes > 0 {
+            (savings_bytes as f64 / self.total_orig_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+        let extra_str = format!("{} ({:.1}%)", format_bytes(savings_bytes as usize), savings_pct);
+        let extra = format!("{:>width$}", extra_str, width = pct_w);
+
+        let template = format!("{{spinner:.cyan.bold}} {{msg}} [{{bar:{bar_w}.cyan.bold/cyan}}] {extra}");
+        let style = indicatif::ProgressStyle::with_template(&template)
+        .unwrap()
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        .progress_chars("█▉▊▋▌▍▎▏ ");
+
+        pb.set_style(style);
+        pb.set_message(msg);
+
+        let pos = (overall_frac * 10000.0) as u64;
+        pb.set_position(pos.min(10000));
     }
-
-    let overall_frac = total_progress_units / total_files as f64;
-    let (fn_w, _, bar_w, pct_w) = calculate_column_widths(term_width);
-
-    let status_str = format!("Overall Progress: {}/{} {}", completed_files, total_files, format!("{:.2}%", overall_frac * 100.0));
-    let truncated_status = truncate_middle(&status_str, fn_w);
-    let msg = format!("{:<width$}", truncated_status, width = fn_w);
-
-
-    let savings_bytes = total_orig_bytes.saturating_sub(total_new_bytes);
-    let savings_pct = if total_orig_bytes > 0 {
-        (savings_bytes as f64 / total_orig_bytes as f64) * 100.0
-    } else {
-        0.0
-    };
-    let extra_str = format!("{} ({:.1}%)", format_bytes(savings_bytes as usize), savings_pct);
-    let extra = format!("{:>width$}", extra_str, width = pct_w);
-
-    let template = format!("{{spinner:.cyan.bold}} {{msg}} [{{bar:{bar_w}.cyan.bold/cyan}}] {extra}");
-    let style = indicatif::ProgressStyle::with_template(&template)
-    .unwrap()
-    .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
-    .progress_chars("█▉▊▋▌▍▎▏ ");
-
-    pb.set_style(style);
-    pb.set_message(msg);
-
-    let pos = (overall_frac * 10000.0) as u64;
-    pb.set_position(pos.min(10000));
 }
 
-/* Loads and decodes raw pixel data from disk or external file converters. */
+/// Loads and decodes raw pixel data from disk or external file converters.
 fn load_file_pixels(cli: &CliArgs, task: &FileTask) -> Result<(u32, u32, u8, u8, usize, Vec<u8>, usize, bool), String> {
     let file_path_str = task.in_path.to_string_lossy().to_string();
     let mut width = 0u32;
@@ -328,43 +374,16 @@ fn load_file_pixels(cli: &CliArgs, task: &FileTask) -> Result<(u32, u32, u8, u8,
 
         let dec = open_png(
             c_file.as_ptr(),
-                           true,
-                           &mut width,
-                           &mut height,
-                           &mut bit_depth,
-                           &mut color_type,
-                           &mut stride_usize,
+            true,
+            &mut width,
+            &mut height,
+            &mut bit_depth,
+            &mut color_type,
+            &mut stride_usize,
         );
 
         if dec.is_null() {
             return Err(format!("Failed to decode PNG {}", file_path_str));
-        }
-
-        if !cli.force_trials {
-            let count = png_get_text_count(dec);
-            let mut already_optimized = false;
-
-            for idx in 0..count {
-                let mut kw_ptr: *const std::os::raw::c_char = std::ptr::null();
-                let mut txt_ptr: *const std::os::raw::c_char = std::ptr::null();
-                if png_get_text_data(dec, idx, &mut kw_ptr, &mut txt_ptr) {
-                    if !kw_ptr.is_null() {
-                        let keyword = unsafe { CStr::from_ptr(kw_ptr) }.to_str().unwrap_or("");
-                        if keyword == "optipng-rs" {
-                            already_optimized = true;
-                        }
-                    }
-                    free_text_data(kw_ptr as *mut _, txt_ptr as *mut _);
-                    if already_optimized {
-                        break;
-                    }
-                }
-            }
-
-            if already_optimized {
-                close_png(dec);
-                return Ok((0, 0, 0, 0, 0, Vec::new(), 0, true));
-            }
         }
 
         stride = stride_usize;
@@ -395,7 +414,7 @@ fn load_file_pixels(cli: &CliArgs, task: &FileTask) -> Result<(u32, u32, u8, u8,
     Ok((width, height, bit_depth, color_type, stride, raw_pixels, orig_idat_size, false))
 }
 
-/* Intermediate payload produced by lazy decoding and reduction prior to trial dispatch. */
+/// Intermediate payload produced by lazy decoding and reduction prior to trial dispatch.
 struct PreparedData {
     total_trials: usize,
     total_scanlines: usize,
@@ -413,20 +432,22 @@ struct PreparedData {
     out_color_type: u8,
     trials: Vec<TrialConfig>,
     is_skipped: bool,
+    error_msg: Option<String>,
 }
 
-/* Performs lazy decoding and reduction heuristics for a file task when activated. */
+/// Performs lazy decoding and reduction heuristics for a file task when activated.
 fn prepare_file_data(cli: &CliArgs, task: &FileTask) -> PreparedData {
     let (width, height, bit_depth, color_type, stride, mut raw_pixels, orig_idat_size, is_skipped) =
     match load_file_pixels(cli, task) {
         Ok(res) => res,
-        Err(_) => {
+        Err(err_msg) => {
             return PreparedData {
                 total_trials: 0, total_scanlines: 0, best_size: usize::MAX, best_config: None,
                 orig_idat_size: 0, image_data: None, shared_palette: None, shared_trns: None,
                 width: 0, height: 0, orig_bit_depth: 0, orig_color_type: 0,
                 out_bit_depth: 0, out_color_type: 0, trials: Vec::new(),
                 is_skipped: true,
+                error_msg: Some(err_msg),
             };
         }
     };
@@ -439,6 +460,7 @@ fn prepare_file_data(cli: &CliArgs, task: &FileTask) -> PreparedData {
             width, height, orig_bit_depth: bit_depth, orig_color_type: color_type,
             out_bit_depth: bit_depth, out_color_type: color_type, trials: Vec::new(),
             is_skipped,
+            error_msg: None,
         };
     }
 
@@ -476,10 +498,11 @@ fn prepare_file_data(cli: &CliArgs, task: &FileTask) -> PreparedData {
         width, height, orig_bit_depth: bit_depth, orig_color_type: color_type,
         out_bit_depth, out_color_type, trials,
         is_skipped: false,
+        error_msg: None,
     }
 }
 
-/* Encapsulates overall work distribution state and thread synchronization structures. */
+/// Encapsulates overall work distribution state and thread synchronization structures.
 struct Scheduler {
     files: Vec<FileState>,
     active_indices: Vec<usize>,
@@ -488,16 +511,17 @@ struct Scheduler {
     total_orig_bytes: u64,
     total_new_bytes: u64,
     overall_pb: Option<indicatif::ProgressBar>,
+    last_overall_pb_update: Option<Instant>,
     multi_progress: Option<Arc<indicatif::MultiProgress>>,
 }
 
-/* Defines a single work task assigned to a thread. */
+/// Defines a single work task assigned to a thread.
 enum WorkTask {
     Trial { file_idx: usize, trial_idx: usize },
     Terminate,
 }
 
-/* Output writer: executes final stream encoding or file operations when file trials finish. */
+/// Output writer: executes final stream encoding or file operations when file trials finish.
 fn finalize_file_write(cli: &CliArgs, file_state: &mut FileState) -> u64 {
     if cli.simulate || file_state.is_skipped {
         return 0;
@@ -648,58 +672,121 @@ fn main() {
 
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    if let Some(ref ext_in) = cli.external_input {
-        input_paths.push((PathBuf::from(ext_in), true));
+    // Initialize evaluation progress bar (gray spinner, file number column, cyan bar in brackets)
+    let scan_pb = if !cli.quiet {
+        let pb = indicatif::ProgressBar::new_spinner();
+        let term_w = get_terminal_width();
+        let bar_w = term_w.saturating_sub(12).max(10);
+        let template = format!("{{spinner:.dim}} {{msg}} [{{bar:{bar_w}.cyan.bold/cyan}}]");
+        let style = indicatif::ProgressStyle::with_template(&template)
+        .unwrap()
+        .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+        .progress_chars("█▉▊▋▌▍▎▏ ");
+        pb.set_style(style);
+        pb.set_message(format!("{:>6}", 0));
+        Some(pb)
     } else {
+        None
+    };
+
+    let mut stats = ScanStats::default();
+
+    if let Some(ref ext_in) = cli.external_input {
+        let p = PathBuf::from(ext_in);
+        let (is_valid, is_opt) = check_png_file(&p, cli.force_trials);
+        if is_valid {
+            stats.valid_pngs += 1;
+            if is_opt {
+                stats.already_optimized += 1;
+            } else {
+                input_paths.push((p, true));
+            }
+        } else {
+            stats.non_pngs += 1;
+            eprintln!("Error: '{}' is not a valid PNG file", ext_in);
+        }
+    } else {
+        let mut found_files = Vec::new();
+
         for target in &cli.files {
             let path = PathBuf::from(target);
             if path.is_dir() || target == "." {
-                let mut dir_files = Vec::new();
                 let _ = scan_directory(
                     &path,
                     1,
                     cli.max_depth,
                     cli.recursive,
+                    cli.force_trials,
+                    &base_dir,
                     &mut visited_dirs,
                     &mut visited_files,
-                    &mut dir_files,
+                    &mut found_files,
+                    scan_pb.as_ref(),
+                                       &mut stats,
                 );
-                dir_files.sort();
-                for f in dir_files {
-                    input_paths.push((f, false));
-                }
             } else if path.is_file() {
                 let canonical_file = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 if visited_files.insert(canonical_file) {
-                    input_paths.push((path, false));
+                    if let Some(ref pb) = scan_pb {
+                        pb.tick();
+                    }
+
+                    let rel_path = if cli.recursive {
+                        path.strip_prefix(&base_dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string()
+                    } else {
+                        path.file_name()
+                        .map(|f| f.to_string_lossy().to_string())
+                        .unwrap_or_else(|| path.to_string_lossy().to_string())
+                    };
+
+                    let (is_valid, is_already_optimized) = check_png_file(&path, cli.force_trials);
+                    if !is_valid {
+                        stats.non_pngs += 1;
+                        let error_mark = console::style("✖").red().bright();
+                        if let Some(ref pb) = scan_pb {
+                            pb.println(format!("{} {} is not a valid PNG file", error_mark, rel_path));
+                        } else {
+                            eprintln!("{} {} is not a valid PNG file", error_mark, rel_path);
+                        }
+                        continue;
+                    }
+
+                    stats.valid_pngs += 1;
+
+                    if is_already_optimized {
+                        stats.already_optimized += 1;
+                        if let Some(ref pb) = scan_pb {
+                            pb.println(format!("- {} -> skipped (already optimized)", rel_path));
+                        }
+                    } else {
+                        found_files.push(path);
+                        if let Some(ref pb) = scan_pb {
+                            pb.set_message(format!("{:>6}", found_files.len()));
+                        }
+                    }
                 }
-            } else if target.contains('*') || target.contains('?') {
-                let parent = path.parent().unwrap_or_else(|| Path::new("."));
-                let mut matching_files = Vec::new();
-                let _ = scan_directory(
-                    parent,
-                    1,
-                    cli.max_depth,
-                    cli.recursive,
-                    &mut visited_dirs,
-                    &mut visited_files,
-                    &mut matching_files,
-                );
-                matching_files.sort();
-                for f in matching_files {
-                    input_paths.push((f, false));
-                }
-            } else {
-                input_paths.push((path, false));
             }
+        }
+
+        for f in found_files {
+            input_paths.push((f, false));
         }
     }
 
-    if input_paths.is_empty() {
-        if !cli.quiet {
-            println!("No PNG files found to process.");
-        }
-        std::process::exit(0);
+    if let Some(ref pb) = scan_pb {
+        pb.finish_and_clear();
+    }
+
+    // Print scan breakdown summary
+    if !cli.quiet {
+        println!("\nSCAN COMPLETED:");
+        println!("  Valid PNG files found  : {}", stats.valid_pngs);
+        println!("  Already optimized .... : {}", stats.already_optimized);
+        println!("  Non-PNG / invalid files: {}", stats.non_pngs);
+        println!("  Files to be processed  : {}\n", stats.valid_pngs - stats.already_optimized);
     }
 
     let is_multi_file = input_paths.len() > 1;
@@ -773,8 +860,8 @@ fn main() {
             out_color_type: 0,
             trials: Vec::new(),
                          next_trial_idx: 0,
-                         pb: None,
                          is_skipped: false,
+                         error_msg: None,
                          is_processed: false,
                          is_prepared: false,
                          is_preparing: false,
@@ -787,13 +874,12 @@ fn main() {
         None
     };
 
-    let overall_pb = multi_progress.as_ref().map(|mp| {
-        let pb = mp.add(indicatif::ProgressBar::new(10000));
-        update_overall_pb(&pb, &file_states, 0, 0, get_terminal_width());
-        pb
-    });
+    // Initialize single overall progress bar for all threads
+    let overall_pb = multi_progress
+    .as_ref()
+    .map(|mp| mp.add(indicatif::ProgressBar::new(10000)));
 
-    let scheduler_inner = Scheduler {
+    let mut scheduler_inner = Scheduler {
         files: file_states,
         active_indices: Vec::new(),
         next_file_to_prepare: 0,
@@ -801,13 +887,19 @@ fn main() {
         total_orig_bytes: 0,
         total_new_bytes: 0,
         overall_pb,
+        last_overall_pb_update: None,
         multi_progress,
     };
+
+    if let Some(pb) = scheduler_inner.overall_pb.clone() {
+        let term_w = get_terminal_width();
+        scheduler_inner.update_overall_pb(&pb, term_w);
+    }
 
     run_multithreaded_pipeline(cli, scheduler_inner);
 }
 
-/* Worker loop orchestrator: manages trial execution, lazy file loading, memory bounds, and thread synchronization. */
+/// Worker loop orchestrator: manages trial execution, lazy file loading, memory bounds, and thread synchronization.
 fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
     let start_time = Instant::now();
     let total_files = scheduler_inner.files.len();
@@ -818,7 +910,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
 
     let mut handles = Vec::new();
 
-    for _ in 0..cli_arc.mt {
+    for _worker_id in 0..cli_arc.mt {
         let scheduler_clone = Arc::clone(&scheduler);
         let condvar_clone = Arc::clone(&condvar);
         let cli_ref = Arc::clone(&cli_arc);
@@ -865,104 +957,107 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
                             lock.next_file_to_prepare += 1;
                             lock.files[next_idx].is_preparing = true;
 
-                            if lock.files[next_idx].pb.is_none() {
-                                if let Some(ref mp) = lock.multi_progress {
-                                    let pb = indicatif::ProgressBar::new(10000);
-                                    if let Some(ref opb) = lock.overall_pb {
-                                        mp.insert_before(opb, pb.clone());
-                                    } else {
-                                        mp.add(pb.clone());
-                                    }
-                                    let term_w = get_terminal_width();
-                                    update_file_pb(
-                                        &pb,
-                                        &lock.files[next_idx].rel_path,
-                                        cli_ref.zi,
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        term_w,
-                                    );
-                                    lock.files[next_idx].pb = Some(pb);
-                                }
-                            }
-
                             let task = lock.files[next_idx].task.clone();
                             drop(lock);
 
                             let prep = prepare_file_data(&cli_ref, &task);
-
                             lock = scheduler_clone.lock().unwrap();
-                            let state = &mut lock.files[next_idx];
-                            state.is_preparing = false;
-                            state.is_prepared = true;
-                            state.total_trials = prep.total_trials;
-                            state.total_scanlines = prep.total_scanlines;
-                            state.best_size = prep.best_size;
-                            state.best_config = prep.best_config;
-                            state.orig_idat_size = prep.orig_idat_size;
-                            state.image_data = prep.image_data;
-                            state.shared_palette = prep.shared_palette;
-                            state.shared_trns = prep.shared_trns;
-                            state.width = prep.width;
-                            state.height = prep.height;
-                            state.orig_bit_depth = prep.orig_bit_depth;
-                            state.orig_color_type = prep.orig_color_type;
-                            state.out_bit_depth = prep.out_bit_depth;
-                            state.out_color_type = prep.out_color_type;
-                            state.trials = prep.trials;
-                            state.is_skipped = prep.is_skipped;
+                            let mp = lock.multi_progress.clone();
+                            let overall_pb = lock.overall_pb.clone();
 
-                            if state.is_skipped || state.trials.is_empty() {
-                                let orig_size = state.task.orig_size;
-                                state.is_processed = true;
+                            let (has_error, is_skipped_or_empty, rel_path, orig_size, orig_color_type, orig_bit_depth, width, height) = {
+                                let state = &mut lock.files[next_idx];
+                                state.is_preparing = false;
+                                state.is_prepared = true;
+                                state.total_trials = prep.total_trials;
+                                state.total_scanlines = prep.total_scanlines;
+                                state.best_size = prep.best_size;
+                                state.best_config = prep.best_config;
+                                state.orig_idat_size = prep.orig_idat_size;
+                                state.image_data = prep.image_data;
+                                state.shared_palette = prep.shared_palette;
+                                state.shared_trns = prep.shared_trns;
+                                state.width = prep.width;
+                                state.height = prep.height;
+                                state.orig_bit_depth = prep.orig_bit_depth;
+                                state.orig_color_type = prep.orig_color_type;
+                                state.out_bit_depth = prep.out_bit_depth;
+                                state.out_color_type = prep.out_color_type;
+                                state.trials = prep.trials;
+                                state.is_skipped = prep.is_skipped;
+                                state.error_msg = prep.error_msg;
 
-                                if let Some(ref pb) = state.pb {
-                                    let red_str = format_reduction_info(state, cli_ref.zi);
-                                    finish_file_pb(
-                                        pb,
-                                        &state.rel_path,
-                                        &red_str,
-                                        "skipped (already optimized)",
-                                                   true,
-                                    );
+                                let has_error = state.error_msg.is_some();
+                                let is_skipped_or_empty = state.is_skipped || state.trials.is_empty();
+                                if has_error || is_skipped_or_empty {
+                                    state.is_processed = true;
+                                }
+
+                                (
+                                    has_error,
+                                 is_skipped_or_empty,
+                                 state.rel_path.clone(),
+                                 state.task.orig_size,
+                                 state.orig_color_type,
+                                 state.orig_bit_depth,
+                                 state.width,
+                                 state.height,
+                                )
+                            };
+
+                            if has_error {
+                                let err = lock.files[next_idx].error_msg.as_ref().unwrap();
+                                if let Some(ref mp_handle) = mp {
+                                    let x_mark = console::style("✗").red().bright();
+                                    let _ = mp_handle.println(format!("{} {} - Error: {}", x_mark, rel_path, err));
                                 }
 
                                 lock.finished_files += 1;
                                 lock.total_orig_bytes += orig_size;
                                 lock.total_new_bytes += orig_size;
 
-                                if let Some(ref opb) = lock.overall_pb {
-                                    update_overall_pb(
-                                        opb,
-                                        &lock.files,
-                                        lock.total_orig_bytes,
-                                        lock.total_new_bytes,
-                                        get_terminal_width(),
-                                    );
+                                if let Some(ref opb) = overall_pb {
+                                    let term_w = get_terminal_width();
+                                    lock.update_overall_pb(opb, term_w);
                                 }
 
                                 condvar_clone.notify_all();
                                 continue;
                             }
 
-                            let term_w = get_terminal_width();
-                            if let Some(ref pb) = state.pb {
-                                update_file_pb(
-                                    pb,
-                                    &state.rel_path,
-                                    cli_ref.zi,
-                                    state.completed_trials,
-                                    state.total_trials,
-                                    state.completed_scanlines,
-                                    state.total_scanlines,
-                                    term_w,
-                                );
+                            if is_skipped_or_empty {
+                                if let Some(ref mp_handle) = mp {
+                                    let _ = mp_handle.println(format!("- {} -> skipped (already optimized)", rel_path));
+                                }
+
+                                lock.finished_files += 1;
+                                lock.total_orig_bytes += orig_size;
+                                lock.total_new_bytes += orig_size;
+
+                                if let Some(ref opb) = overall_pb {
+                                    let term_w = get_terminal_width();
+                                    lock.update_overall_pb(opb, term_w);
+                                }
+
+                                condvar_clone.notify_all();
+                                continue;
                             }
 
-                            let trial_idx = state.next_trial_idx;
-                            state.next_trial_idx += 1;
+                            if let Some(ref mp_handle) = mp {
+                                let color_name = color_type_short_name(orig_color_type);
+                                let _ = mp_handle.println(format!(
+                                    "Opened {} -> {} x {} / {} bit / {}",
+                                    rel_path, width, height, orig_bit_depth, color_name
+                                ));
+                            }
+
+                            if let Some(ref opb) = overall_pb {
+                                let term_w = get_terminal_width();
+                                lock.update_overall_pb(opb, term_w);
+                            }
+
+                            let trial_idx = lock.files[next_idx].next_trial_idx;
+                            lock.files[next_idx].next_trial_idx += 1;
 
                             lock.active_indices.push(next_idx);
 
@@ -998,7 +1093,6 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
                             )
                         };
 
-                        let term_w = get_terminal_width();
                         let sched_cb = Arc::clone(&scheduler_clone);
 
                         let on_scanlines = |chunk_rows: usize| {
@@ -1007,27 +1101,9 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
                                 let state = &mut lock.files[file_idx];
                                 state.completed_scanlines += chunk_rows;
 
-                                if let Some(ref pb) = state.pb {
-                                    update_file_pb(
-                                        pb,
-                                        &state.rel_path,
-                                        cli_ref.zi,
-                                        state.completed_trials,
-                                        state.total_trials,
-                                        state.completed_scanlines,
-                                        state.total_scanlines,
-                                        term_w,
-                                    );
-                                }
-
-                                if let Some(ref opb) = lock.overall_pb {
-                                    update_overall_pb(
-                                        opb,
-                                        &lock.files,
-                                        lock.total_orig_bytes,
-                                        lock.total_new_bytes,
-                                        term_w,
-                                    );
+                                if let Some(opb) = lock.overall_pb.clone() {
+                                    let term_w = get_terminal_width();
+                                    lock.update_overall_pb(&opb, term_w);
                                 }
                             }
                         };
@@ -1048,87 +1124,81 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
                         );
 
                         let mut lock = scheduler_clone.lock().unwrap();
-                        let state = &mut lock.files[file_idx];
-                        state.completed_trials += 1;
+                        let mp = lock.multi_progress.clone();
+                        {
+                            let state = &mut lock.files[file_idx];
+                            state.completed_trials += 1;
 
-                        if trial_idat_size < state.best_size && trial_idat_size > 0 {
-                            state.best_size = trial_idat_size;
-                            state.best_config = Some(trial);
-                            if cli_ref.zi == 2 {
-                                state.best_bytes = winning_bytes;
+                            if trial_idat_size < state.best_size && trial_idat_size > 0 {
+                                state.best_size = trial_idat_size;
+                                state.best_config = Some(trial);
+                                if cli_ref.zi == 2 {
+                                    state.best_bytes = winning_bytes;
+                                }
                             }
                         }
 
-                        if let Some(ref pb) = state.pb {
-                            update_file_pb(
-                                pb,
-                                &state.rel_path,
-                                cli_ref.zi,
-                                state.completed_trials,
-                                state.total_trials,
-                                state.completed_scanlines,
-                                state.total_scanlines,
-                                term_w,
-                            );
-                        }
-
-                        if let Some(ref opb) = lock.overall_pb {
-                            update_overall_pb(
-                                opb,
-                                &lock.files,
-                                lock.total_orig_bytes,
-                                lock.total_new_bytes,
-                                term_w,
-                            );
+                        if let Some(ref opb) = lock.overall_pb.clone() {
+                            let term_w = get_terminal_width();
+                            lock.update_overall_pb(&opb, term_w);
                         }
 
                         if lock.files[file_idx].completed_trials == lock.files[file_idx].total_trials {
                             let actual_size = finalize_file_write(&cli_ref, &mut lock.files[file_idx]);
                             let orig_size = lock.files[file_idx].task.orig_size;
 
-                            let state = &mut lock.files[file_idx];
-                            state.is_processed = true;
-                            state.image_data = None;
+                            let (rel_path, is_skipped, red_str) = {
+                                let state = &mut lock.files[file_idx];
+                                state.is_processed = true;
+                                state.image_data = None;
+                                (
+                                    state.rel_path.clone(),
+                                 state.is_skipped,
+                                 format_reduction_info(state, cli_ref.zi),
+                                )
+                            };
 
                             let final_size = if actual_size > 0 { actual_size } else { orig_size };
 
-                            if let Some(ref pb) = state.pb {
-                                let red_str = format_reduction_info(state, cli_ref.zi);
-                                let sav_str = if state.is_skipped {
-                                    "skipped".to_string()
-                                } else if final_size < orig_size {
-                                    let saved = orig_size - final_size;
-                                    let pct = (saved as f64 / orig_size as f64) * 100.0;
-                                    format!("saved {} ({:.1}%)", format_bytes(saved as usize), pct)
-                                } else if final_size == orig_size {
-                                    "no size reduction".to_string()
+                            let sav_str = if is_skipped {
+                                "skipped".to_string()
+                            } else if final_size < orig_size {
+                                let saved = orig_size - final_size;
+                                let pct = (saved as f64 / orig_size as f64) * 100.0;
+                                format!("saved {} ({:.1}%)", format_bytes(saved as usize), pct)
+                            } else if final_size == orig_size {
+                                "no size reduction".to_string()
+                            } else {
+                                let diff = final_size - orig_size;
+                                let pct = (diff as f64 / orig_size as f64) * 100.0;
+                                format!("+{} (+{:.1}%)", format_bytes(diff as usize), pct)
+                            };
+
+                            if let Some(ref mp_handle) = mp {
+                                if is_skipped {
+                                    let _ = mp_handle.println(format!("- {} -> skipped", rel_path));
                                 } else {
-                                    let diff = final_size - orig_size;
-                                    let pct = (diff as f64 / orig_size as f64) * 100.0;
-                                    format!("+{} (+{:.1}%)", format_bytes(diff as usize), pct)
-                                };
-                                finish_file_pb(pb, &state.rel_path, &red_str, &sav_str, state.is_skipped);
+                                    let check_mark = console::style("✓").green().bright();
+                                    let _ = mp_handle.println(format!("{} {} [{}] -> {}", check_mark, rel_path, red_str, sav_str));
+                                }
                             }
 
                             lock.finished_files += 1;
                             lock.total_orig_bytes += orig_size;
                             lock.total_new_bytes += final_size;
 
-                            if let Some(ref opb) = lock.overall_pb {
-                                update_overall_pb(
-                                    opb,
-                                    &lock.files,
-                                    lock.total_orig_bytes,
-                                    lock.total_new_bytes,
-                                    term_w,
-                                );
+                            if let Some(ref opb) = lock.overall_pb.clone() {
+                                let term_w = get_terminal_width();
+                                lock.update_overall_pb(opb, term_w);
                             }
 
                             lock.active_indices.retain(|&i| i != file_idx);
                             condvar_clone.notify_all();
                         }
                     }
-                    WorkTask::Terminate => break,
+                    WorkTask::Terminate => {
+                        break;
+                    }
                 }
             }
         }));

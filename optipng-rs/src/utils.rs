@@ -39,7 +39,7 @@ pub fn color_type_short_name(color_type: u8) -> &'static str {
         0 => "Gray",
         2 => "RGB",
         3 => "Palette",
-        4 => "Gray+Alpha",
+        4 => "Gray+A",
         6 => "RGBA",
         _ => "Unknown",
     }

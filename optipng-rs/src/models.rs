@@ -1,6 +1,6 @@
 /**************************************
  * optipng-rs: Shared data structures *
- ************************************+*/
+ **************************************/
 
 use std::path::PathBuf;
 
@@ -70,7 +70,7 @@ pub struct ReductionResult {
     pub final_trns: Option<Vec<u8>>,
 }
 
-/// Holds runtime state, raw pixel buffers, and progress tracker for a single file task.
+/// Holds runtime state and pixel buffers for a single file task.
 pub struct FileState {
     pub task: FileTask,
     pub rel_path: String,
@@ -93,8 +93,8 @@ pub struct FileState {
     pub out_color_type: u8,
     pub trials: Vec<TrialConfig>,
     pub next_trial_idx: usize,
-    pub pb: Option<indicatif::ProgressBar>,
     pub is_skipped: bool,
+    pub error_msg: Option<String>,
     pub is_processed: bool,
     pub is_prepared: bool,
     pub is_preparing: bool,
