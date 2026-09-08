@@ -13,6 +13,7 @@ pub fn parse_args() -> CliArgs {
         external_input: None,
         opt_level: 2,
         mt: 0,
+        memory_limit: 78.0, // Default 78% limit
         zi: 1,
         zc: None,
         zm: None,
@@ -237,6 +238,17 @@ pub fn parse_args() -> CliArgs {
                 cli.f.get_or_insert_with(Vec::new).append(&mut parsed);
             }
             i += 1;
+            continue;
+        }
+
+        if arg == "--memory-limit" {
+            opt_tokens.push(arg.clone());
+            i += 1;
+            if i < raw_args.len() {
+                cli.memory_limit = raw_args[i].parse().unwrap_or(78.0);
+                opt_tokens.push(raw_args[i].clone());
+                i += 1;
+            }
             continue;
         }
 

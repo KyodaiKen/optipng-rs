@@ -1,11 +1,37 @@
 /*************************************************************
-* optipng-rs: Formatting, file times, callbacks, and helpers *
-**************************************************************/
+ * optipng-rs: Formatting, file times, callbacks, and helpers *
+ **************************************************************/
 
 use std::ffi::c_void;
 use std::fs::{self, FileTimes, Metadata};
 use std::path::Path;
 use std::time::Duration;
+use sysinfo::System;
+
+/// Truncates a string in the middle using an ellipsis if it exceeds max_width.
+pub fn truncate_middle(s: &str, max_width: usize) -> String {
+    if s.chars().count() <= max_width {
+        return s.to_string();
+    }
+    if max_width <= 1 {
+        return "…".to_string();
+    }
+    let keep_len = (max_width - 1) / 2;
+    let front: String = s.chars().take(keep_len).collect();
+    let back: String = s.chars().skip(s.chars().count() - keep_len).collect();
+    format!("{}…{}", front, back)
+}
+
+/// Checks if current memory consumption is strictly below the given percentage limit.
+pub fn is_memory_safe(sys: &mut System, limit_pct: f64) -> bool {
+    sys.refresh_memory();
+    let total = sys.total_memory() as f64;
+    let used = sys.used_memory() as f64;
+    if total <= 0.0 {
+        return true;
+    }
+    (used / total) * 100.0 <= limit_pct
+}
 
 pub fn color_type_name(color_type: u8) -> &'static str {
     match color_type {
@@ -15,6 +41,30 @@ pub fn color_type_name(color_type: u8) -> &'static str {
         4 => "YA (Grayscale+Transparency)",
         6 => "RGBA (RGB+Transparency)",
         _ => "Unknown",
+    }
+}
+
+/// Returns short color type names for concise CLI progress output.
+pub fn color_type_short_name(color_type: u8) -> &'static str {
+    match color_type {
+        0 => "Gray",
+        2 => "RGB",
+        3 => "Palette",
+        4 => "Gray+Alpha",
+        6 => "RGBA",
+        _ => "Unknown",
+    }
+}
+
+/// Returns the number of color/alpha channels for a given PNG color type.
+pub fn color_type_channels(color_type: u8) -> u8 {
+    match color_type {
+        0 => 1, // Grayscale
+        2 => 3, // RGB
+        3 => 1, // Palette index
+        4 => 2, // Gray + Alpha
+        6 => 4, // RGBA
+        _ => 0,
     }
 }
 
@@ -63,11 +113,11 @@ pub fn parse_ranges_u8(input: &str) -> Vec<u8> {
     .collect()
 }
 
-//FORMATTING
+// FORMATTING
 pub fn format_bytes(bytes: usize) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"];
     if bytes == 0 {
-        return "0 B".to_string();
+        return "0B".to_string();
     }
     let base = 1024f64;
     let bytes_f = bytes as f64;
@@ -75,10 +125,10 @@ pub fn format_bytes(bytes: usize) -> String {
     let digit = digit.min(UNITS.len() - 1);
 
     if digit == 0 {
-        format!("{} {}", bytes, UNITS[0])
+        format!("{}{}", bytes, UNITS[0])
     } else {
         let value = bytes_f / base.powi(digit as i32);
-        format!("{:.2} {}", value, UNITS[digit])
+        format!("{:.2}{}", value, UNITS[digit])
     }
 }
 
@@ -102,7 +152,7 @@ pub fn format_duration(duration: Duration) -> String {
     }
 }
 
-//CALLBACKS
+// CALLBACKS
 pub type PngWriteCallback = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> usize;
 
 pub unsafe extern "C" fn buffer_write_cb(user_data: *mut c_void, buf: *const u8, len: usize) -> usize {

@@ -7,6 +7,9 @@ edition = "2024"
 decoder = { path = "../png_stream_dec/decoder" }
 encoder = { path = "../png_stream_enc/encoder" }
 owo-colors = "4.0"
+indicatif = "0.17"
+sysinfo = "0.30"
+console = "0.15"
 
 [[bin]]
 name = "optipng-rs"
