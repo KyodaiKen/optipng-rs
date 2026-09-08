@@ -33,17 +33,6 @@ pub fn is_memory_safe(sys: &mut System, limit_pct: f64) -> bool {
     (used / total) * 100.0 <= limit_pct
 }
 
-pub fn color_type_name(color_type: u8) -> &'static str {
-    match color_type {
-        0 => "Y (Grayscale)",
-        2 => "RGB",
-        3 => "Palette",
-        4 => "YA (Grayscale+Transparency)",
-        6 => "RGBA (RGB+Transparency)",
-        _ => "Unknown",
-    }
-}
-
 /// Returns short color type names for concise CLI progress output.
 pub fn color_type_short_name(color_type: u8) -> &'static str {
     match color_type {

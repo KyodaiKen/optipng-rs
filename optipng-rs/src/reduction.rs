@@ -5,7 +5,6 @@
 use std::collections::{HashMap, HashSet};
 use crate::models::CliArgs;
 use crate::models::ReductionResult;
-use crate::utils::color_type_name;
 
 pub fn reduce_image(
     cli: &CliArgs,
@@ -49,10 +48,6 @@ pub fn reduce_image(
 
                     out_bit_depth = 8;
                     stride /= 2;
-
-                    if !cli.quiet {
-                        println!("  (i) Reducing bit depth from 16 to 8 (fake 16-bit image detected)");
-                    }
                 }
             }
         }
@@ -109,16 +104,7 @@ pub fn reduce_image(
                         raw_pixels.truncate(write_idx);
                         raw_pixels.shrink_to_fit();
 
-                        let old_color_type = out_color_type;
                         out_color_type = if out_color_type == 6 { 2 } else { 0 };
-
-                        if !cli.quiet {
-                            println!(
-                                "  (i) Reducing color type from {} to {} (all pixels are 100% opaque)",
-                                     color_type_name(old_color_type),
-                                     color_type_name(out_color_type)
-                            );
-                        }
                     }
                 }
             }
@@ -169,16 +155,7 @@ pub fn reduce_image(
                     raw_pixels.truncate(write_idx);
                     raw_pixels.shrink_to_fit();
 
-                    let old_color_type = out_color_type;
                     out_color_type = if out_color_type == 6 { 4 } else { 0 };
-
-                    if !cli.quiet {
-                        println!(
-                            "  (i) Reducing color type from {} to {} (R==G==B across all pixels)",
-                                 color_type_name(old_color_type),
-                                 color_type_name(out_color_type)
-                        );
-                    }
                 }
             }
 
@@ -306,23 +283,12 @@ pub fn reduce_image(
                             }
                         }
 
-                        let old_color_type = out_color_type;
                         out_color_type = 3; // Palette
 
                         // Save final palette data
                         final_palette = Some(palette_rgb);
                         if !palette_trns.is_empty() {
                             final_trns = Some(palette_trns);
-                        }
-
-                        if !cli.quiet && color_type != 3 {
-                            println!(
-                                "  (i) Reducing color type from {} to {} ({} bit, Color count: {})",
-                                     color_type_name(old_color_type),
-                                     color_type_name(out_color_type),
-                                     out_bit_depth,
-                                     palette_map.len()
-                            );
                         }
                     }
                 }

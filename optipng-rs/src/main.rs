@@ -181,7 +181,7 @@ fn finish_file_pb(
     is_skipped: bool,
 ) {
     if is_skipped {
-        pb.println(format!("- {} [{}] -> {}", rel_path, reduction_str, savings_str));
+        pb.println(format!("- {} -> {}", rel_path, savings_str));
         pb.finish_and_clear();
     } else {
         let style = indicatif::ProgressStyle::with_template("{msg}").unwrap();
