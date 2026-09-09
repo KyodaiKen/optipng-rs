@@ -279,7 +279,7 @@ fn format_reduction_info(state: &FileState, zi: u8) -> String {
 impl Scheduler {
     /// Formats and updates the single overall progress bar shared across all threads.
     /// Throttles UI updates to a maximum of 10 Hz (100 ms) unless overall progress is complete.
-    fn update_overall_pb(&mut self, pb: &indicatif::ProgressBar, term_width: usize) {
+    fn update_overall_pb(&mut self, pb: &indicatif::ProgressBar, term_width: usize, force: bool) {
         let total_files = self.files.len();
         if total_files == 0 {
             pb.set_position(10000);
@@ -304,7 +304,7 @@ impl Scheduler {
 
         let overall_frac = total_progress_units / total_files as f64;
 
-        if overall_frac < 1.0 {
+        if !force && overall_frac < 1.0 {
             if let Some(last) = self.last_overall_pb_update {
                 if last.elapsed() < std::time::Duration::from_millis(100) {
                     return;
@@ -899,7 +899,7 @@ fn main() {
 
     if let Some(pb) = scheduler_inner.overall_pb.clone() {
         let term_w = get_terminal_width();
-        scheduler_inner.update_overall_pb(&pb, term_w);
+        scheduler_inner.update_overall_pb(&pb, term_w, false);
     }
 
     run_multithreaded_pipeline(cli, scheduler_inner);
@@ -1023,7 +1023,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
 
                                 if let Some(ref opb) = overall_pb {
                                     let term_w = get_terminal_width();
-                                    lock.update_overall_pb(opb, term_w);
+                                    lock.update_overall_pb(opb, term_w, true);
                                 }
 
                                 condvar_clone.notify_all();
@@ -1041,7 +1041,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
 
                                 if let Some(ref opb) = overall_pb {
                                     let term_w = get_terminal_width();
-                                    lock.update_overall_pb(opb, term_w);
+                                    lock.update_overall_pb(opb, term_w, true);
                                 }
 
                                 condvar_clone.notify_all();
@@ -1058,7 +1058,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
 
                             if let Some(ref opb) = overall_pb {
                                 let term_w = get_terminal_width();
-                                lock.update_overall_pb(opb, term_w);
+                                lock.update_overall_pb(opb, term_w, false);
                             }
 
                             let trial_idx = lock.files[next_idx].next_trial_idx;
@@ -1108,7 +1108,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
 
                                 if let Some(opb) = lock.overall_pb.clone() {
                                     let term_w = get_terminal_width();
-                                    lock.update_overall_pb(&opb, term_w);
+                                    lock.update_overall_pb(&opb, term_w, false);
                                 }
                             }
                         };
@@ -1145,7 +1145,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
 
                         if let Some(ref opb) = lock.overall_pb.clone() {
                             let term_w = get_terminal_width();
-                            lock.update_overall_pb(&opb, term_w);
+                            lock.update_overall_pb(&opb, term_w, false);
                         }
 
                         if lock.files[file_idx].completed_trials == lock.files[file_idx].total_trials {
@@ -1194,7 +1194,7 @@ fn run_multithreaded_pipeline(cli: CliArgs, scheduler_inner: Scheduler) {
 
                             if let Some(ref opb) = lock.overall_pb.clone() {
                                 let term_w = get_terminal_width();
-                                lock.update_overall_pb(opb, term_w);
+                                lock.update_overall_pb(opb, term_w, true);
                             }
 
                             lock.active_indices.retain(|&i| i != file_idx);
