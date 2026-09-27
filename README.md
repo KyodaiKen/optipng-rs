@@ -85,7 +85,7 @@ OPTIMIZATION OPTIONS:
   -zi <1|2>          Encoder implementation: 1 = zlib (default), 2 = Zöpfli (SLOW!!!)
                         Zöpfli only supports the parameters -zc and -f, and
                         the compression level is mapped to Zöpfli's number of
-                        iterations as follows (level => itrerations):
+                        iterations as follows (level => iterations):
                             1 => 1
                             2 => 3
                             3 => 5
