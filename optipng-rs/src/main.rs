@@ -100,12 +100,12 @@ fn scan_directory(
     max_depth: Option<usize>,
     recursive: bool,
     force_trials: bool,
-        base_dir: &Path,
-        visited_dirs: &mut HashSet<PathBuf>,
-        visited_files: &mut HashSet<PathBuf>,
-        found_files: &mut Vec<PathBuf>,
-        scan_pb: Option<&indicatif::ProgressBar>,
-        stats: &mut ScanStats,
+    base_dir: &Path,
+    visited_dirs: &mut HashSet<PathBuf>,
+    visited_files: &mut HashSet<PathBuf>,
+    found_files: &mut Vec<PathBuf>,
+    scan_pb: Option<&indicatif::ProgressBar>,
+    stats: &mut ScanStats,
 ) -> io::Result<()> {
     let canonical_dir = match fs::canonicalize(dir) {
         Ok(p) => p,
@@ -143,12 +143,12 @@ fn scan_directory(
                         max_depth,
                         recursive,
                         force_trials,
-                            base_dir,
-                            visited_dirs,
-                            visited_files,
-                            found_files,
-                            scan_pb,
-                            stats,
+                        base_dir,
+                        visited_dirs,
+                        visited_files,
+                        found_files,
+                        scan_pb,
+                        stats,
                     )?;
                 }
             }
@@ -695,18 +695,7 @@ fn main() {
 
     if let Some(ref ext_in) = cli.external_input {
         let p = PathBuf::from(ext_in);
-        let (is_valid, is_opt) = check_png_file(&p, cli.force_trials);
-        if is_valid {
-            stats.valid_pngs += 1;
-            if is_opt {
-                stats.already_optimized += 1;
-            } else {
-                input_paths.push((p, true));
-            }
-        } else {
-            stats.non_pngs += 1;
-            eprintln!("{}", format_error(&format!("'{}' is not a valid PNG file", ext_in)));
-        }
+        input_paths.push((p, true));
     } else {
         let mut found_files = Vec::new();
 
@@ -724,7 +713,7 @@ fn main() {
                     &mut visited_files,
                     &mut found_files,
                     scan_pb.as_ref(),
-                                       &mut stats,
+                    &mut stats,
                 );
             } else if path.is_file() {
                 let canonical_file = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
