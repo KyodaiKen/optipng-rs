@@ -1,6 +1,4 @@
-/**************************************
- * optipng-rs: Shared data structures *
- **************************************/
+/// Shared data structures for liboptipng.
 
 use std::path::PathBuf;
 
@@ -14,7 +12,7 @@ pub struct TrialConfig {
 }
 
 /// Contains all parsed command-line arguments.
-pub struct CliArgs {
+pub struct OptimizationTask {
     pub files: Vec<String>,
     pub external_input: Option<String>,
     pub opt_level: u8,
@@ -38,7 +36,6 @@ pub struct CliArgs {
     pub show_help: bool,
     pub force_trials: bool,
     pub force_reenc: bool,
-    pub cmd_options: String,
     pub memory_limit: f64,
 }
 

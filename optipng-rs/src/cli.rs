@@ -2,13 +2,13 @@
  * optipng-rs: Command-line parsing and definitions *
  *************************************************+*/
 
-use crate::models::CliArgs;
-use crate::utils::{parse_ranges_i32, parse_ranges_u8};
+use liboptipng_rs::OptimizationTask;
+use liboptipng_rs::{parse_ranges_i32, parse_ranges_u8};
 use std::env;
 
-pub fn parse_args() -> CliArgs {
+pub fn parse_args() -> OptimizationTask {
     let raw_args: Vec<String> = env::args().skip(1).collect();
-    let mut cli = CliArgs {
+    let mut cli = OptimizationTask {
         files: Vec::new(),
         external_input: None,
         opt_level: 2,
@@ -33,10 +33,8 @@ pub fn parse_args() -> CliArgs {
         show_help: false,
         force_trials: false,
         force_reenc: false,
-        cmd_options: String::new(),
     };
 
-    let mut opt_tokens: Vec<String> = Vec::new();
     let mut i = 0;
 
     while i < raw_args.len() {
@@ -48,7 +46,7 @@ pub fn parse_args() -> CliArgs {
         }
 
         if arg == "-e" {
-            opt_tokens.push(arg.clone());
+
             i += 1;
             if i < raw_args.len() {
                 cli.external_input = Some(raw_args[i].clone());
@@ -62,7 +60,7 @@ pub fn parse_args() -> CliArgs {
         }
 
         if arg == "-out" {
-            opt_tokens.push(arg.clone());
+
             i += 1;
             if i < raw_args.len() {
                 cli.out_file = Some(raw_args[i].clone());
@@ -73,11 +71,11 @@ pub fn parse_args() -> CliArgs {
 
         if arg == "-R" {
             cli.recursive = true;
-            opt_tokens.push(arg.clone());
+
             i += 1;
             if i < raw_args.len() && raw_args[i].chars().all(|c| c.is_ascii_digit()) {
                 cli.max_depth = raw_args[i].parse::<usize>().ok();
-                opt_tokens.push(raw_args[i].clone());
+
                 i += 1;
             }
             continue;
@@ -86,21 +84,21 @@ pub fn parse_args() -> CliArgs {
         if arg.starts_with("-R") && arg.len() > 2 && arg[2..].chars().all(|c| c.is_ascii_digit()) {
             cli.recursive = true;
             cli.max_depth = arg[2..].parse::<usize>().ok();
-            opt_tokens.push(arg.clone());
+
             i += 1;
             continue;
         }
 
         if arg == "-ft" {
             cli.force_trials = true;
-            opt_tokens.push(arg.clone());
+
             i += 1;
             continue;
         }
 
         if arg == "-force" {
             cli.force_reenc = true;
-            opt_tokens.push(arg.clone());
+
             i += 1;
             continue;
         }
@@ -108,27 +106,27 @@ pub fn parse_args() -> CliArgs {
         if arg.starts_with("-o") && arg.len() > 2 && arg[2..].chars().all(|c| c.is_ascii_digit()) {
             let level: u8 = arg[2..].parse().unwrap_or(2);
             cli.opt_level = level.min(7);
-            opt_tokens.push(arg.clone());
+
             i += 1;
             continue;
         }
 
         if arg.starts_with("-mt") && arg.len() > 3 && arg[3..].chars().all(|c| c.is_ascii_digit()) {
             cli.mt = arg[3..].parse().unwrap_or(0);
-            opt_tokens.push(arg.clone());
+
             i += 1;
             continue;
         }
 
         if arg.starts_with("-zi") {
             let val_str = if arg.len() > 3 {
-                opt_tokens.push(arg.clone());
+
                 Some(arg[3..].to_string())
             } else {
-                opt_tokens.push(arg.clone());
+
                 i += 1;
                 if i < raw_args.len() {
-                    opt_tokens.push(raw_args[i].clone());
+
                     Some(raw_args[i].clone())
                 } else {
                     None
@@ -155,13 +153,13 @@ pub fn parse_args() -> CliArgs {
 
         if arg.starts_with("-zc") {
             let val_str = if arg.len() > 3 {
-                opt_tokens.push(arg.clone());
+
                 Some(arg[3..].to_string())
             } else {
-                opt_tokens.push(arg.clone());
+
                 i += 1;
                 if i < raw_args.len() {
-                    opt_tokens.push(raw_args[i].clone());
+
                     Some(raw_args[i].clone())
                 } else {
                     None
@@ -177,13 +175,13 @@ pub fn parse_args() -> CliArgs {
 
         if arg.starts_with("-zm") {
             let val_str = if arg.len() > 3 {
-                opt_tokens.push(arg.clone());
+
                 Some(arg[3..].to_string())
             } else {
-                opt_tokens.push(arg.clone());
+
                 i += 1;
                 if i < raw_args.len() {
-                    opt_tokens.push(raw_args[i].clone());
+
                     Some(raw_args[i].clone())
                 } else {
                     None
@@ -199,13 +197,13 @@ pub fn parse_args() -> CliArgs {
 
         if arg.starts_with("-zs") {
             let val_str = if arg.len() > 3 {
-                opt_tokens.push(arg.clone());
+
                 Some(arg[3..].to_string())
             } else {
-                opt_tokens.push(arg.clone());
+
                 i += 1;
                 if i < raw_args.len() {
-                    opt_tokens.push(raw_args[i].clone());
+
                     Some(raw_args[i].clone())
                 } else {
                     None
@@ -221,13 +219,13 @@ pub fn parse_args() -> CliArgs {
 
         if arg.starts_with("-f") {
             let val_str = if arg.len() > 2 {
-                opt_tokens.push(arg.clone());
+
                 Some(arg[2..].to_string())
             } else {
-                opt_tokens.push(arg.clone());
+
                 i += 1;
                 if i < raw_args.len() {
-                    opt_tokens.push(raw_args[i].clone());
+
                     Some(raw_args[i].clone())
                 } else {
                     None
@@ -242,11 +240,11 @@ pub fn parse_args() -> CliArgs {
         }
 
         if arg == "--memory-limit" {
-            opt_tokens.push(arg.clone());
+
             i += 1;
             if i < raw_args.len() {
                 cli.memory_limit = raw_args[i].parse().unwrap_or(78.0);
-                opt_tokens.push(raw_args[i].clone());
+
                 i += 1;
             }
             continue;
@@ -254,41 +252,41 @@ pub fn parse_args() -> CliArgs {
 
         match arg.as_str() {
             "-o" => {
-                opt_tokens.push(arg.clone());
+
                 i += 1;
                 if i < raw_args.len() {
-                    opt_tokens.push(raw_args[i].clone());
+
                     let level: u8 = raw_args[i].parse().unwrap_or(2);
                     cli.opt_level = level.min(7);
                     i += 1;
                 }
             }
             "-mt" => {
-                opt_tokens.push(arg.clone());
+
                 i += 1;
                 if i < raw_args.len() {
-                    opt_tokens.push(raw_args[i].clone());
+
                     cli.mt = raw_args[i].parse().unwrap_or(0);
                     i += 1;
                 }
             }
-            "-backup" | "-keep" => { cli.backup = true; opt_tokens.push(arg.clone()); i += 1; }
-            "-simulate" => { cli.simulate = true; opt_tokens.push(arg.clone()); i += 1; }
-            "-quiet" | "-silent" => { cli.quiet = true; opt_tokens.push(arg.clone()); i += 1; }
-            "-nc" => { cli.nc = true; opt_tokens.push(arg.clone()); i += 1; }
-            "-nb" => { cli.nb = true; opt_tokens.push(arg.clone()); i += 1; }
-            "-np" => { cli.np = true; opt_tokens.push(arg.clone()); i += 1; }
-            "-nx" => { cli.nx = true; opt_tokens.push(arg.clone()); i += 1; }
-            "-nz" => { cli.nz = true; opt_tokens.push(arg.clone()); i += 1; }
+            "-backup" | "-keep" => { cli.backup = true; i += 1; }
+            "-simulate" => { cli.simulate = true; i += 1; }
+            "-quiet" | "-silent" => { cli.quiet = true; i += 1; }
+            "-nc" => { cli.nc = true; i += 1; }
+            "-nb" => { cli.nb = true; i += 1; }
+            "-np" => { cli.np = true; i += 1; }
+            "-nx" => { cli.nx = true; i += 1; }
+            "-nz" => { cli.nz = true; i += 1; }
             "--" => {
-                opt_tokens.push(arg.clone());
+
                 i += 1;
                 cli.files.extend(raw_args[i..].iter().cloned());
                 break;
             }
             _ => {
                 if arg.starts_with('-') {
-                    opt_tokens.push(arg.clone());
+
                 } else {
                     cli.files.push(arg.clone());
                 }
@@ -302,7 +300,6 @@ pub fn parse_args() -> CliArgs {
         cli.nz = true;
     }
 
-    cli.cmd_options = opt_tokens.join(" ");
 
     if let Some(ref mut list) = cli.zc { list.sort_unstable(); list.dedup(); }
     if let Some(ref mut list) = cli.zm { list.sort_unstable(); list.dedup(); }
@@ -340,17 +337,10 @@ pub fn print_usage() {
         -o <level>         Optimization level 0-7 (default: 2)
         -zi <1|2>          Encoder implementation: 1 = zlib (default), 2 = Zöpfli (SLOW!!!)
             Zöpfli only supports the parameters -zc and -f, and
-            the compression level is mapped to Zöpfli's number of
-            iterations as follows (level => iterations):
-                1 => 1
-                2 => 3
-                3 => 5
-                4 => 10
-                5 => 15   Zöpfli default
-                6 => 30
-                7 => 50
-                8 => 100
-                9 => 500  Maximum squeeze
+            the compression level (-zc) is the number of iterations between 1 and 500.
+            Number of iterations greater than 4 are not recommended because of diminishing
+            returns in compression ratio with exorbitant higher memory usage and processing
+            time.
 
             Optimization preset levels (-o) are as follows:
                 -o0 => unchanged, no IDAT re-encoding
@@ -388,7 +378,7 @@ pub fn print_usage() {
     METADATA & DEDUPLICATION:
         * All non-essential PNG metadata is stripped during optimization.
         * A 'tEXt' chunk with key 'optipng-rs' is injected to track optimization state:
-            - Line 1: User-specified command options (if present).
-            - Line 2: Winning trial settings (-zc -zm -zs -f) or '-o0'."#
+            - Winning trial settings (zlib: zc zm zs f, Zopfli: filter)
+            - 'fp' when the -nz fast path was used (no re-encoding)."#
     );
 }

@@ -1,6 +1,4 @@
-/***************************************************************
- * optipng-rs: Compression trial routines and configuration    *
- ***************************************************************/
+/// Compression trial routines and configuration.
 
 use std::cmp::Reverse;
 use std::ffi::{c_void, CString};
@@ -10,17 +8,17 @@ use pngstreamenc::{
     close_png_encode_get_idat_size, encode_scanlines, open_png_encode_stream, ZlibOptions,
 };
 
-use crate::models::TrialConfig;
+pub use crate::models::TrialConfig;
 use crate::utils::{buffer_write_cb, counter_write_cb, PngWriteCallback};
 
-/* Maps zlib compression levels (-zc) to Zöpfli iteration counts. */
+/// Maps zlib compression levels (-zc) to Zopfli iteration counts.
 pub fn zc_to_zopfli_iterations(zc: i32) -> i32 {
     match zc {
         1 => 1,
         2 => 3,
         3 => 5,
         4 => 10,
-        5 => 15,  // Zöpfli default
+        5 => 15,  // Zopfli default
         6 => 30,
         7 => 50,
         8 => 100,
@@ -29,7 +27,7 @@ pub fn zc_to_zopfli_iterations(zc: i32) -> i32 {
     }
 }
 
-/* Returns difficulty ranking for zlib strategies for trial ordering. */
+/// Returns difficulty ranking for zlib strategies for trial ordering.
 pub fn zs_difficulty(zs: i32) -> u8 {
     match zs {
         1 => 4, // Filtered (Hardest)
@@ -40,7 +38,7 @@ pub fn zs_difficulty(zs: i32) -> u8 {
     }
 }
 
-/* Returns preset Zöpfli optimization combinations based on optimization level. */
+/// Returns preset Zopfli optimization combinations based on optimization level.
 pub fn get_zopfli_opt_combinations(level: u8) -> (Vec<i32>, Vec<u8>) {
     match level {
         1 => (vec![1], vec![3]),
@@ -54,7 +52,7 @@ pub fn get_zopfli_opt_combinations(level: u8) -> (Vec<i32>, Vec<u8>) {
     }
 }
 
-/* Returns preset zlib optimization parameter combinations based on level and image type. */
+/// Returns preset zlib optimization parameter combinations based on level and image type.
 pub fn get_opt_combinations(level: u8, color_type: u8, bit_depth: u8) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<u8>) {
     match level {
         0 | 1 => {
@@ -75,7 +73,7 @@ pub fn get_opt_combinations(level: u8, color_type: u8, bit_depth: u8) -> (Vec<i3
     }
 }
 
-/* Builds and sorts the complete list of trials to attempt for an image configuration. */
+/// Builds and sorts the complete list of trials to attempt for an image configuration.
 pub fn build_trial_list(
     zc_list: &[i32],
     zm_list: &[i32],
@@ -99,7 +97,7 @@ pub fn build_trial_list(
     trials
 }
 
-/* Executes a single compression trial on raw image data and returns IDAT size & optional stream. */
+/// Executes a single compression trial on raw image data and returns IDAT size & optional stream.
 pub fn run_single_trial(
     image_data: &Arc<Vec<u8>>,
     shared_palette: &Option<Arc<Vec<u8>>>,
@@ -109,8 +107,6 @@ pub fn run_single_trial(
     out_bit_depth: u8,
     out_color_type: u8,
     trial: &TrialConfig,
-    opt_level: u8,
-    cmd_opts: &str,
     zi: u8,
     on_scanline_chunk: Option<&dyn Fn(usize)>,
 ) -> (usize, Option<Vec<u8>>) {
@@ -122,11 +118,7 @@ pub fn run_single_trial(
     let mut trial_output_buffer = Vec::new();
     let mut dummy_written: usize = 0;
 
-    let z_level = if is_zopfli {
-        zc_to_zopfli_iterations(trial.zc)
-    } else {
-        trial.zc
-    };
+    let z_level = trial.zc;
 
     let options = ZlibOptions {
         z_implementation: zi,
@@ -148,16 +140,13 @@ pub fn run_single_trial(
         None => (std::ptr::null(), 0),
     };
 
-    let opt_info = if opt_level == 0 {
-        "-o0".to_string()
-    } else if cmd_opts.is_empty() && zi == 1 {
-        format!("{}{}{}{}", trial.zc, trial.zm, trial.zs, trial.f)
-    } else if !cmd_opts.is_empty() && zi == 1 {
-        format!("{}\n{}{}{}{}", cmd_opts, trial.zc, trial.zm, trial.zs, trial.f)
-    } else if !cmd_opts.is_empty() && zi == 2 {
-        format!("{}\n{}{}", cmd_opts, trial.zc, trial.f)
+    // Winning settings stored as the tEXt chunk value:
+    //   zlib   -> zc zm zs f
+    //   Zopfli -> f (compression settings are not user-relevant there)
+    let opt_info = if zi == 2 {
+        format!("{}", trial.f)
     } else {
-        "".to_string()
+        format!("{}{}{}{}", trial.zc, trial.zm, trial.zs, trial.f)
     };
 
     let c_key = CString::new("optipng-rs").unwrap();

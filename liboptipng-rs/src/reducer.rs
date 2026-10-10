@@ -1,13 +1,11 @@
-/***********************************************************
- * optipng-rs: OPTIPNG COLOR & BIT-DEPTH REDUCTION PIPELINE *
- ***********************************************************/
+/// OPTIPNG color & bit-depth reduction pipeline.
 
 use std::collections::{HashMap, HashSet};
-use crate::models::CliArgs;
-use crate::models::ReductionResult;
+use crate::OptimizationTask;
+use crate::ReductionResult;
 
 pub fn reduce_image(
-    cli: &CliArgs,
+    cli: &OptimizationTask,
     width: u32,
     height: u32,
     color_type: u8,
@@ -119,13 +117,11 @@ pub fn reduce_image(
 
                 for px in raw_pixels.chunks_exact(px_bytes) {
                     if sample_bytes == 1 {
-                        // 8-bit: Check if R == G and G == B
                         if px[0] != px[1] || px[1] != px[2] {
                             is_grayscale = false;
                             break;
                         }
                     } else {
-                        // 16-bit: Compare sample words
                         if px[0..2] != px[2..4] || px[2..4] != px[4..6] {
                             is_grayscale = false;
                             break;
@@ -139,12 +135,9 @@ pub fn reduce_image(
 
                     for i in 0..num_pixels {
                         let px_start = i * px_bytes;
-
-                        // Retain Red channel sample as Gray
                         raw_pixels.copy_within(px_start..px_start + sample_bytes, write_idx);
                         write_idx += sample_bytes;
 
-                        // Retain Alpha channel sample if present
                         if out_color_type == 6 {
                             let alpha_start = px_start + 3 * sample_bytes;
                             raw_pixels.copy_within(alpha_start..alpha_start + sample_bytes, write_idx);
@@ -159,18 +152,17 @@ pub fn reduce_image(
                 }
             }
 
-            // 2d. Reduction to Indexed / Palette (Unique Colors <= 256, down to 1, 2, or 4-bit)
+            // 2d. Reduction to Indexed / Palette
             if !cli.np && out_bit_depth == 8 && (out_color_type == 2 || out_color_type == 6) {
                 let px_bytes = match out_color_type {
-                    0 => 1, // Gray
-                    2 => 3, // RGB
-                    4 => 2, // GrayA
-                    6 => 4, // RGBA
+                    0 => 1,
+                    2 => 3,
+                    4 => 2,
+                    6 => 4,
                     _ => 0,
                 };
 
                 if px_bytes > 0 {
-                    // 1. Collect unique pixel colors (preserves Scanline / First Appearance order)
                     let mut unique_colors: Vec<Vec<u8>> = Vec::new();
                     let mut seen = HashSet::new();
 
@@ -183,7 +175,6 @@ pub fn reduce_image(
                         }
                     }
 
-                    // Process palette reduction only if total unique colors <= 256
                     if unique_colors.len() <= 256 && !unique_colors.is_empty() && seen.len() <= 256 {
                         let extract_rgba = |px: &[u8]| -> (u8, u8, u8, u8) {
                             match out_color_type {
@@ -195,15 +186,11 @@ pub fn reduce_image(
                             }
                         };
 
-                        // 2. Sort palette to optimize for DEFLATE + tRNS chunk trimming:
-                        // - Non-opaque colors (a < 255) are moved to the front sorted by alpha.
-                        // - Opaque colors (a == 255) maintain Scanline First-Appearance order.
                         unique_colors.sort_by_key(|px| {
                             let (_, _, _, a) = extract_rgba(px);
                             (a == 255, a)
                         });
 
-                        // 3. Build lookup map and PNG PLTE / tRNS structures
                         let mut palette_map: HashMap<Vec<u8>, u8> = HashMap::with_capacity(unique_colors.len());
                         let mut palette_rgb: Vec<u8> = Vec::with_capacity(unique_colors.len() * 3);
                         let mut palette_trns: Vec<u8> = Vec::with_capacity(unique_colors.len());
@@ -220,7 +207,6 @@ pub fn reduce_image(
                             }
                         }
 
-                        // 4. Re-index image pixel data to sorted 8-bit palette indices
                         let num_pixels = raw_pixels.len() / px_bytes;
                         for i in 0..num_pixels {
                             let px_start = i * px_bytes;
@@ -229,7 +215,6 @@ pub fn reduce_image(
                         }
                         raw_pixels.truncate(num_pixels);
 
-                        // 5. Determine optimal sub-8-bit depth (1, 2, 4, or 8 bits)
                         let target_bit_depth: u8 = match unique_colors.len() {
                             0..=2 => 1,
                             3..=4 => 2,
@@ -237,7 +222,6 @@ pub fn reduce_image(
                             _ => 8,
                         };
 
-                        // 6. Pack sub-byte pixels row-by-row if bit depth < 8
                         if target_bit_depth < 8 {
                             out_bit_depth = target_bit_depth;
                             let w = width as usize;
@@ -250,7 +234,7 @@ pub fn reduce_image(
                                 let row_pixels = &raw_pixels[row_start..row_end];
 
                                 let mut current_byte = 0u8;
-                                let mut bit_pos = 0; // Filled bits in current byte
+                                let mut bit_pos = 0;
 
                                 for &idx in row_pixels {
                                     let shift = 8 - bit_pos - target_bit_depth;
@@ -264,7 +248,6 @@ pub fn reduce_image(
                                     }
                                 }
 
-                                // Pad trailing partial byte for current scanline
                                 if bit_pos > 0 {
                                     packed_pixels.push(current_byte);
                                 }
@@ -274,7 +257,6 @@ pub fn reduce_image(
 
                         raw_pixels.shrink_to_fit();
 
-                        // 7. Trim trailing 255 alpha values from tRNS chunk per PNG spec
                         if !has_trns {
                             palette_trns.clear();
                         } else {
@@ -283,9 +265,8 @@ pub fn reduce_image(
                             }
                         }
 
-                        out_color_type = 3; // Palette
+                        out_color_type = 3;
 
-                        // Save final palette data
                         final_palette = Some(palette_rgb);
                         if !palette_trns.is_empty() {
                             final_trns = Some(palette_trns);

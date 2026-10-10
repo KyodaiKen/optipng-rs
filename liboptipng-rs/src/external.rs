@@ -1,11 +1,9 @@
-/***************************************************************
-* optipng-rs: EXTERNAL FORMAT DECODERS (TGA / PPM / PGM / PAM) *
-***************************************************************/
+/// External format decoders (TGA, PPM, PGM, PAM).
 
 use std::fs;
 use crate::models::LoadedImage;
 
-// Decodes Targa (.tga) images (Uncompressed and RLE TrueColor/Grayscale)
+/// Decodes Targa (.tga) images (Uncompressed and RLE TrueColor/Grayscale).
 pub fn decode_tga(data: &[u8]) -> Result<LoadedImage, String> {
     if data.len() < 18 {
         return Err("TGA header too short".into());
@@ -132,16 +130,16 @@ pub fn decode_tga(data: &[u8]) -> Result<LoadedImage, String> {
 
     Ok(LoadedImage {
         width,
-       height,
-       bit_depth: 8,
-       color_type,
-       stride: row_bytes,
-       raw_pixels: final_pixels,
-       orig_idat_size: data.len(),
+        height,
+        bit_depth: 8,
+        color_type,
+        stride: row_bytes,
+        raw_pixels: final_pixels,
+        orig_idat_size: data.len(),
     })
 }
 
-// Decodes Netpbm images (.ppm, .pgm, .pam)
+/// Decodes Netpbm images (.ppm, .pgm, .pam).
 pub fn decode_netpbm(data: &[u8]) -> Result<LoadedImage, String> {
     let mut pos = 0;
 
@@ -156,8 +154,8 @@ pub fn decode_netpbm(data: &[u8]) -> Result<LoadedImage, String> {
         let line_bytes = &data[start..*pos];
         *pos += 1;
         std::str::from_utf8(line_bytes)
-        .map(|s| s.trim().to_string())
-        .map_err(|e| e.to_string())
+            .map(|s| s.trim().to_string())
+            .map_err(|e| e.to_string())
     };
 
     let magic = read_line(&mut pos)?;
@@ -291,7 +289,7 @@ pub fn decode_netpbm(data: &[u8]) -> Result<LoadedImage, String> {
     }
 }
 
-// Dispatches image loading based on file headers / extensions
+/// Dispatches image loading based on file headers / extensions.
 pub fn load_external_image(file_path: &str) -> Result<LoadedImage, String> {
     let data = fs::read(file_path).map_err(|e| format!("Failed to read file {:?}: {}", file_path, e))?;
 

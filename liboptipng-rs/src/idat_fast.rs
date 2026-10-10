@@ -1,6 +1,4 @@
-/*****************************************************************
-* optipng-rs: RAW PNG CHUNK COPY & RE-PARTITIONING FOR -o0 / -nz *
-*****************************************************************/
+/// Raw PNG chunk copy & re-partitioning for -o0 / -nz fast path.
 
 use std::fs;
 use std::path::Path;
@@ -37,8 +35,8 @@ fn png_crc(chunk_type: &[u8; 4], data: &[u8]) -> u32 {
     !crc
 }
 
-/* Copies existing compressed IDAT bytes from an existing PNG without zlib re-encoding,
- * coalesces IDAT chunks, and inserts/updates the `tEXt` metadata chunk. */
+/// Copies existing compressed IDAT bytes from an existing PNG without zlib re-encoding,
+/// coalesces IDAT chunks, and inserts/updates the `tEXt` metadata chunk.
 pub fn copy_png_idat_and_add_text(
     in_path: &Path,
     out_path: &Path,

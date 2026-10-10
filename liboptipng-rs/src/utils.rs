@@ -1,6 +1,4 @@
-/*************************************************************
- * optipng-rs: Formatting, file times, callbacks, and helpers *
- **************************************************************/
+/// Formatting, file times, callbacks, and helpers.
 
 use std::ffi::c_void;
 use std::fs::{self, FileTimes, Metadata};
@@ -97,9 +95,9 @@ pub fn parse_ranges_i32(input: &str) -> Vec<i32> {
 
 pub fn parse_ranges_u8(input: &str) -> Vec<u8> {
     parse_ranges_i32(input)
-    .into_iter()
-    .filter_map(|v| u8::try_from(v).ok())
-    .collect()
+        .into_iter()
+        .filter_map(|v| u8::try_from(v).ok())
+        .collect()
 }
 
 // FORMATTING
