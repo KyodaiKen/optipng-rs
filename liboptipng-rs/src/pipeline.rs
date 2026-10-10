@@ -50,20 +50,7 @@ pub fn run_optimization(cli: OptimizationTask) {
 
     if let Some(ref ext_in) = cli.external_input {
         let p = PathBuf::from(ext_in);
-        let (is_valid, is_opt) = check_png_file(&p, cli.force_trials);
-        if is_valid {
-            stats.valid_pngs += 1;
-            if is_opt {
-                stats.already_optimized += 1;
-            } else {
-                input_paths.push((p, true));
-            }
-        } else {
-            stats.non_pngs += 1;
-            if !cli.quiet {
-                eprintln!("{}", format_error(&format!("'{}' is not a valid PNG file", ext_in)));
-            }
-        }
+        input_paths.push((p, true));
     } else {
         let mut found_files = Vec::new();
 
