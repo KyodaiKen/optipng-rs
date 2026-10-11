@@ -23,13 +23,13 @@ use crate::trials::{build_trial_list, get_opt_combinations, get_zopfli_opt_combi
 use crate::utils::*;
 
 /// Top-level entry point: validates inputs, scans for targets, runs the multi-threaded pipeline, prints summary.
-pub fn run_optimization(cli: OptimizationTask) {
+pub fn optimize_files(task: OptimizationTask) {
     let mut input_paths: Vec<(PathBuf, bool)> = Vec::new();
     let mut visited_dirs = HashSet::new();
     let mut visited_files = HashSet::new();
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    let scan_pb = if !cli.quiet {
+    let scan_pb = if !task.quiet {
         let pb = indicatif::ProgressBar::new_spinner();
         pb.enable_steady_tick(std::time::Duration::from_millis(100));
         let term_w = get_terminal_width();
@@ -48,21 +48,21 @@ pub fn run_optimization(cli: OptimizationTask) {
 
     let mut stats = ScanStats::default();
 
-    if let Some(ref ext_in) = cli.external_input {
+    if let Some(ref ext_in) = task.external_input {
         let p = PathBuf::from(ext_in);
         input_paths.push((p, true));
     } else {
         let mut found_files = Vec::new();
 
-        for target in &cli.files {
+        for target in &task.files {
             let path = PathBuf::from(target);
             if path.is_dir() || target == "." {
                 let _ = scan_directory(
                     &path,
                     1,
-                    cli.max_depth,
-                    cli.recursive,
-                    cli.force_trials,
+                    task.max_depth,
+                    task.recursive,
+                    task.force_trials,
                     &base_dir,
                     &mut visited_dirs,
                     &mut visited_files,
@@ -77,7 +77,7 @@ pub fn run_optimization(cli: OptimizationTask) {
                         pb.tick();
                     }
 
-                    let rel_path = if cli.recursive {
+                    let rel_path = if task.recursive {
                         path.strip_prefix(&base_dir)
                             .unwrap_or(&path)
                             .to_string_lossy()
@@ -88,11 +88,11 @@ pub fn run_optimization(cli: OptimizationTask) {
                             .unwrap_or_else(|| path.to_string_lossy().to_string())
                     };
 
-                    let (is_valid, is_already_optimized) = check_png_file(&path, cli.force_trials);
+                    let (is_valid, is_already_optimized) = check_png_file(&path, task.force_trials);
                     if !is_valid {
                         stats.non_pngs += 1;
                         let error_mark = console::style("✖").red().bright();
-                        if !cli.quiet {
+                        if !task.quiet {
                             if let Some(ref pb) = scan_pb {
                                 pb.println(format!("{} {} is not a valid PNG file", error_mark, rel_path));
                             } else {
@@ -108,7 +108,7 @@ pub fn run_optimization(cli: OptimizationTask) {
                         stats.already_optimized += 1;
                         if let Some(ref pb) = scan_pb {
                             pb.println(format!("- {} -> skipped (already optimized)", rel_path));
-                        } else if !cli.quiet {
+                        } else if !task.quiet {
                             eprintln!("- {} -> skipped (already optimized)", rel_path);
                         }
                     } else {
@@ -130,7 +130,7 @@ pub fn run_optimization(cli: OptimizationTask) {
         pb.finish_and_clear();
     }
 
-    if !cli.quiet {
+    if !task.quiet {
         println!("\nSCAN COMPLETED:");
         println!("  Valid PNG files found  : {}", stats.valid_pngs);
         println!("  Already optimized .... : {}", stats.already_optimized);
@@ -144,7 +144,7 @@ pub fn run_optimization(cli: OptimizationTask) {
     for (in_path, is_ext) in &input_paths {
         let size = fs::metadata(in_path).map(|m| m.len()).unwrap_or(0);
 
-        let out_path = if let Some(ref out_arg) = cli.out_file {
+        let out_path = if let Some(ref out_arg) = task.out_file {
             let out_p = PathBuf::from(out_arg);
             if is_multi_file || out_p.is_dir() || out_arg.ends_with('/') || out_arg.ends_with('\\') {
                 if let Err(e) = fs::create_dir_all(&out_p) {
@@ -172,22 +172,22 @@ pub fn run_optimization(cli: OptimizationTask) {
     let task_count = tasks.len();
     let mut file_states = Vec::with_capacity(task_count);
 
-    for task in tasks {
-        let rel_path = if cli.recursive {
-            task.in_path
+    for file_task in tasks {
+        let rel_path = if task.recursive {
+            file_task.in_path
                 .strip_prefix(&base_dir)
-                .unwrap_or(&task.in_path)
+                .unwrap_or(&file_task.in_path)
                 .to_string_lossy()
                 .to_string()
         } else {
-            task.in_path
+            file_task.in_path
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| task.in_path.to_string_lossy().to_string())
+                .unwrap_or_else(|| file_task.in_path.to_string_lossy().to_string())
         };
 
         file_states.push(FileState {
-            task,
+            task: file_task,
             rel_path,
             total_trials: 0,
             completed_trials: 0,
@@ -216,7 +216,7 @@ pub fn run_optimization(cli: OptimizationTask) {
         });
     }
 
-    let multi_progress = if !cli.quiet {
+    let multi_progress = if !task.quiet {
         Some(Arc::new(indicatif::MultiProgress::new()))
     } else {
         None
@@ -242,7 +242,7 @@ pub fn run_optimization(cli: OptimizationTask) {
         multi_progress,
     };
 
-    run_pipeline(cli, scheduler_inner);
+    run_pipeline(task, scheduler_inner);
 }
 
 /// Validates PNG magic bytes and checks if the file was already optimized by optipng-rs.
@@ -442,7 +442,7 @@ struct PreparedData {
 }
 
 /// Loads and decodes raw pixel data from disk or external file converters.
-fn load_file_pixels(cli: &OptimizationTask, task: &FileTask) -> Result<(u32, u32, u8, u8, usize, Vec<u8>, usize), String> {
+fn load_file_pixels(opt: &OptimizationTask, task: &FileTask) -> Result<(u32, u32, u8, u8, usize, Vec<u8>, usize), String> {
     let file_path_str = task.in_path.to_string_lossy().to_string();
     let mut width = 0u32;
     let mut height = 0u32;
@@ -482,7 +482,7 @@ fn load_file_pixels(cli: &OptimizationTask, task: &FileTask) -> Result<(u32, u32
         stride = stride_usize;
         png_set_count_idat_size(dec, true);
 
-        if cli.nz {
+        if opt.nz {
             raw_pixels = Vec::new();
             orig_idat_size = png_get_idat_size(dec);
             close_png(dec);
@@ -508,9 +508,9 @@ fn load_file_pixels(cli: &OptimizationTask, task: &FileTask) -> Result<(u32, u32
 }
 
 /// Performs lazy decoding and reduction heuristics for a file task.
-fn prepare_file_data(cli: &OptimizationTask, task: &FileTask) -> PreparedData {
+fn prepare_file_data(opt: &OptimizationTask, task: &FileTask) -> PreparedData {
     let (width, height, bit_depth, color_type, stride, mut raw_pixels, orig_idat_size) =
-        match load_file_pixels(cli, task) {
+        match load_file_pixels(opt, task) {
             Ok(res) => res,
             Err(err_msg) => {
                 return PreparedData {
@@ -535,7 +535,7 @@ fn prepare_file_data(cli: &OptimizationTask, task: &FileTask) -> PreparedData {
             }
         };
 
-    if cli.nz {
+    if opt.nz {
         let trial = TrialConfig { zc: 1, zm: 8, zs: 0, f: 0 };
         return PreparedData {
             total_trials: 1,
@@ -563,34 +563,34 @@ fn prepare_file_data(cli: &OptimizationTask, task: &FileTask) -> PreparedData {
         out_bit_depth,
         final_palette,
         final_trns,
-    } = reduce_image(cli, width, height, color_type, bit_depth, stride, &mut raw_pixels);
+    } = reduce_image(opt, width, height, color_type, bit_depth, stride, &mut raw_pixels);
 
     let shared_palette = final_palette.map(Arc::new);
     let shared_trns = final_trns.map(Arc::new);
     let image_data = Some(Arc::new(raw_pixels));
 
-    let (zc_list, zm_list, zs_list, f_list) = if cli.zi == 2 {
-        let (def_zc, def_f) = get_zopfli_opt_combinations(cli.opt_level);
+    let (zc_list, zm_list, zs_list, f_list) = if opt.zi == 2 {
+        let (def_zc, def_f) = get_zopfli_opt_combinations(opt.opt_level);
         (
-            cli.zc.clone().unwrap_or(def_zc),
+            opt.zc.clone().unwrap_or(def_zc),
             vec![8],
             vec![0],
-            cli.f.clone().unwrap_or(def_f),
+            opt.f.clone().unwrap_or(def_f),
         )
     } else {
         let (def_zc, def_zm, def_zs, def_f) =
-            get_opt_combinations(cli.opt_level, out_color_type, out_bit_depth);
+            get_opt_combinations(opt.opt_level, out_color_type, out_bit_depth);
         (
-            cli.zc.clone().unwrap_or(def_zc),
-            cli.zm.clone().unwrap_or(def_zm),
-            cli.zs.clone().unwrap_or(def_zs),
-            cli.f.clone().unwrap_or(def_f),
+            opt.zc.clone().unwrap_or(def_zc),
+            opt.zm.clone().unwrap_or(def_zm),
+            opt.zs.clone().unwrap_or(def_zs),
+            opt.f.clone().unwrap_or(def_f),
         )
     };
 
     let trials = build_trial_list(&zc_list, &zm_list, &zs_list, &f_list);
     let total_trials = trials.len();
-    let total_scanlines = if cli.zi == 2 { 0 } else { total_trials * height as usize };
+    let total_scanlines = if opt.zi == 2 { 0 } else { total_trials * height as usize };
 
     PreparedData {
         total_trials,
@@ -770,8 +770,8 @@ impl Scheduler {
 }
 
 /// Output writer: executes final stream encoding or file operations when trials finish.
-fn finalize_file_write(cli: &OptimizationTask, file_state: &mut FileState) -> u64 {
-    if cli.simulate || file_state.is_skipped {
+fn finalize_file_write(task: &OptimizationTask, file_state: &mut FileState) -> u64 {
+    if task.simulate || file_state.is_skipped {
         return 0;
     }
 
@@ -783,10 +783,10 @@ fn finalize_file_write(cli: &OptimizationTask, file_state: &mut FileState) -> u6
         None => return 0,
     };
 
-    if !cli.force_reenc
+    if !task.force_reenc
         && !file_state.task.is_external
         && file_state.best_size >= file_state.orig_idat_size
-        && !cli.nz
+        && !task.nz
     {
         return 0;
     }
@@ -807,7 +807,7 @@ fn finalize_file_write(cli: &OptimizationTask, file_state: &mut FileState) -> u6
     let input_source = if is_in_place { &old_path } else { original_path };
     let mut success = false;
 
-    let opt_info = if cli.nz {
+    let opt_info = if task.nz {
         "fp".to_string()
     } else {
         format!("{}{}{}{}", best.zc, best.zm, best.zs, best.f)
@@ -817,14 +817,14 @@ fn finalize_file_write(cli: &OptimizationTask, file_state: &mut FileState) -> u6
         if fs::write(out_path, winning_bytes).is_ok() {
             success = out_path.exists();
         }
-    } else if cli.nz && !file_state.task.is_external {
+    } else if task.nz && !file_state.task.is_external {
         if copy_png_idat_and_add_text(input_source, out_path, "optipng-rs", &opt_info).is_ok() {
             success = out_path.exists();
         }
     } else if let Some(ref img_data) = file_state.image_data {
         let c_out_path = CString::new(out_path.to_string_lossy().into_owned()).unwrap();
         let final_options = ZlibOptions {
-            z_implementation: cli.zi,
+            z_implementation: task.zi,
             level: best.zc,
             strategy: best.zs,
             window_bits: 15,
@@ -888,7 +888,7 @@ fn finalize_file_write(cli: &OptimizationTask, file_state: &mut FileState) -> u6
     if success {
         preserve_file_times(out_path, orig_metadata.as_ref());
         let actual_size = fs::metadata(out_path).map(|m| m.len()).unwrap_or(0);
-        if is_in_place && !cli.backup {
+        if is_in_place && !task.backup {
             let _ = fs::remove_file(&old_path);
         }
         actual_size
@@ -901,20 +901,20 @@ fn finalize_file_write(cli: &OptimizationTask, file_state: &mut FileState) -> u6
 }
 
 /// Worker loop orchestrator: manages trial execution, lazy file loading, memory bounds, and synchronization.
-fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
+fn run_pipeline(task: OptimizationTask, scheduler_inner: Scheduler) {
     let start_time = Instant::now();
     let total_files = scheduler_inner.files.len();
 
     let scheduler = Arc::new(Mutex::new(scheduler_inner));
     let condvar = Arc::new(Condvar::new());
-    let cli_arc = Arc::new(cli);
+    let task_arc = Arc::new(task);
 
     let mut handles = Vec::new();
 
-    for _worker_id in 0..cli_arc.mt {
+    for _worker_id in 0..task_arc.mt {
         let scheduler_clone = Arc::clone(&scheduler);
         let condvar_clone = Arc::clone(&condvar);
-        let cli_ref = Arc::clone(&cli_arc);
+        let task_ref = Arc::clone(&task_arc);
 
         handles.push(thread::spawn(move || {
             let mut sys = System::new();
@@ -954,7 +954,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                         }
 
                         let can_activate_new = lock.next_file_to_prepare < lock.files.len()
-                            && is_memory_safe(&mut sys, cli_ref.memory_limit);
+                            && is_memory_safe(&mut sys, task_ref.memory_limit);
 
                         if can_activate_new {
                             let next_idx = lock.next_file_to_prepare;
@@ -964,7 +964,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                             let task = lock.files[next_idx].task.clone();
                             drop(lock);
 
-                            let prep = prepare_file_data(&cli_ref, &task);
+                            let prep = prepare_file_data(&task_ref, &task);
                             lock = scheduler_clone.lock().unwrap();
                             let mp = lock.multi_progress.clone();
                             let overall_pb = lock.overall_pb.clone();
@@ -1013,7 +1013,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                                 let err = lock.files[next_idx].error_msg.as_ref().unwrap();
                                 if let Some(ref mp_handle) = mp {
                                     let _ = mp_handle.println(format_error(&format!("{} - Error: {}", rel_path, err)));
-                                } else if !cli_ref.quiet {
+                                } else if !task_ref.quiet {
                                     eprintln!("{}", format_error(&format!("{} - Error: {}", rel_path, err)));
                                 }
 
@@ -1033,7 +1033,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                             if is_skipped_or_empty {
                                 if let Some(ref mp_handle) = mp {
                                     let _ = mp_handle.println(format!("- {} -> skipped (already optimized)", rel_path));
-                                } else if !cli_ref.quiet {
+                                } else if !task_ref.quiet {
                                     eprintln!("- {} -> skipped (already optimized)", rel_path);
                                 }
 
@@ -1056,7 +1056,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                                     "Opened {} -> {} x {} / {} bit / {}",
                                     rel_path, width, height, orig_bit_depth, color_name
                                 ));
-                            } else if !cli_ref.quiet {
+                            } else if !task_ref.quiet {
                                 let color_name = color_type_short_name(orig_color_type);
                                 eprintln!("Opened {} -> {} x {} / {} bit / {}", rel_path, width, height, orig_bit_depth, color_name);
                             }
@@ -1114,7 +1114,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                         let sched_cb = Arc::clone(&scheduler_clone);
 
                         let on_scanlines = |chunk_rows: usize| {
-                            if cli_ref.zi == 1 {
+                            if task_ref.zi == 1 {
                                 let mut lock = sched_cb.lock().unwrap();
                                 let state = &mut lock.files[file_idx];
                                 state.completed_scanlines += chunk_rows;
@@ -1134,7 +1134,8 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                             out_bit_depth,
                             out_color_type,
                             &trial,
-                            cli_ref.zi,
+                            task_ref.zi,
+                            false,
                             Some(&on_scanlines),
                         );
 
@@ -1147,7 +1148,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                             if trial_idat_size < state.best_size && trial_idat_size > 0 {
                                 state.best_size = trial_idat_size;
                                 state.best_config = Some(trial);
-                                if cli_ref.zi == 2 {
+                                if task_ref.zi == 2 {
                                     state.best_bytes = winning_bytes;
                                 }
                             }
@@ -1159,7 +1160,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                         }
 
                         if lock.files[file_idx].completed_trials == lock.files[file_idx].total_trials {
-                            let actual_size = finalize_file_write(&cli_ref, &mut lock.files[file_idx]);
+                            let actual_size = finalize_file_write(&task_ref, &mut lock.files[file_idx]);
                             let orig_size = lock.files[file_idx].task.orig_size;
 
                             let (rel_path, is_skipped, red_str) = {
@@ -1169,7 +1170,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                                 (
                                     state.rel_path.clone(),
                                     state.is_skipped,
-                                    format_reduction_info(state, cli_ref.zi),
+                                    format_reduction_info(state, task_ref.zi),
                                 )
                             };
 
@@ -1197,7 +1198,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
                                     let _ = mp_handle
                                         .println(format!("{} {} [{}] -> {}", check_mark, rel_path, red_str, sav_str));
                                 }
-                            } else if !cli_ref.quiet {
+                            } else if !task_ref.quiet {
                                 if is_skipped {
                                     eprintln!("- {} -> skipped", rel_path);
                                 } else {
@@ -1237,7 +1238,7 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
         opb.finish_and_clear();
     }
 
-    if !cli_arc.quiet {
+    if !task_arc.quiet {
         let total_orig = final_sched.total_orig_bytes;
         let total_new = final_sched.total_new_bytes;
         let saved_bytes = total_orig.saturating_sub(total_new);
@@ -1266,5 +1267,177 @@ fn run_pipeline(cli: OptimizationTask, scheduler_inner: Scheduler) {
             pct
         );
         println!("  Total processing time : {}", format_duration(duration));
+    }
+}
+
+// ─── In-memory optimization ───────────────────────────────────────────────
+
+/// Result of an in-memory optimization run.
+pub struct MemoryOptimizationResult {
+    /// The fully-encoded optimized PNG byte stream.
+    pub optimized_bytes: Vec<u8>,
+    /// The original IDAT size (before optimization).
+    pub orig_idat_size: usize,
+    /// The winning IDAT size.
+    pub best_idat_size: usize,
+    /// The winning compression config.
+    pub best_config: Option<TrialConfig>,
+    /// Whether the IDAT output is smaller than input.
+    pub is_smaller: bool,
+}
+
+/// Internal accumulator shared across worker threads for in-memory optimization.
+struct MemoryBest {
+    size: usize,
+    config: Option<TrialConfig>,
+    bytes: Option<Vec<u8>>,
+    completed: usize,
+}
+
+/// Optimizes an in-memory PNG image from `task.in_memory_source`.
+/// Runs all compression trials across `task.mt` worker threads (capped to
+/// the trial count), captures the best result, and returns the winning
+/// fully-encoded PNG byte stream.
+///
+/// With `mt == 1` this is simply a single worker — no special-cased path.
+pub fn optimize_memory(task: OptimizationTask) -> Result<MemoryOptimizationResult, String> {
+    use crate::reducer::reduce_image;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    let img = task
+    .in_memory_source
+    .as_ref()
+    .ok_or_else(|| "in_memory_source is not set".to_string())?;
+
+    let width = img.width;
+    let height = img.height;
+    let orig_bit_depth = img.bit_depth;
+    let orig_color_type = img.color_type;
+    let stride = img.stride;
+    let orig_idat_size = img.orig_idat_size;
+    let mut raw_pixels = img.raw_pixels.clone();
+
+    // --- Format reduction (optional) ---
+    let (out_bit_depth, out_color_type, shared_palette, shared_trns) = if task.reduce_format {
+        let rr = reduce_image(
+            &task, width, height, orig_color_type, orig_bit_depth, stride, &mut raw_pixels,
+        );
+        (
+            rr.out_bit_depth,
+         rr.out_color_type,
+         rr.final_palette.map(Arc::new),
+         rr.final_trns.map(Arc::new),
+        )
+    } else {
+        (orig_bit_depth, orig_color_type, None, None)
+    };
+
+    let image_data = Arc::new(raw_pixels);
+
+    // --- Build trial list ---
+    let (zc_list, zm_list, zs_list, f_list) = if task.zi == 2 {
+        let (def_zc, def_f) = get_zopfli_opt_combinations(task.opt_level);
+        (
+            task.zc.clone().unwrap_or(def_zc),
+         vec![8],
+         vec![0],
+         task.f.clone().unwrap_or(def_f),
+        )
+    } else {
+        let (def_zc, def_zm, def_zs, def_f) =
+        get_opt_combinations(task.opt_level, out_color_type, out_bit_depth);
+        (
+            task.zc.clone().unwrap_or(def_zc),
+         task.zm.clone().unwrap_or(def_zm),
+         task.zs.clone().unwrap_or(def_zs),
+         task.f.clone().unwrap_or(def_f),
+        )
+    };
+
+    let trials = Arc::new(build_trial_list(&zc_list, &zm_list, &zs_list, &f_list));
+    let total_trials = trials.len();
+    if total_trials == 0 {
+        return Err("No valid trial configurations generated".to_string());
+    }
+
+    // --- Shared worker state ---
+    let next_idx = Arc::new(AtomicUsize::new(0));
+    let best = Arc::new(Mutex::new(MemoryBest {
+        size: usize::MAX,
+        config: None,
+        bytes: None,
+        completed: 0,
+    }));
+
+    let task_ref = Arc::new(task); // Arc<OptimizationTask> — moved into workers
+    let worker_count = task_ref.mt.max(1).min(total_trials);
+
+    // --- Worker pool ---
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let next_idx = Arc::clone(&next_idx);
+        let best = Arc::clone(&best);
+        let trials = Arc::clone(&trials);
+        let image_data = Arc::clone(&image_data);
+        let shared_palette = shared_palette.clone();
+        let shared_trns = shared_trns.clone();
+        let tref = Arc::clone(&task_ref);
+
+        handles.push(thread::spawn(move || {
+            loop {
+                // Atomically claim the next trial (or exit if exhausted)
+                let idx = next_idx.fetch_add(1, Ordering::SeqCst);
+                if idx >= total_trials {
+                    break;
+                }
+
+                // Execute trial — no lock held
+                let (trial_idat_size, trial_bytes) = run_single_trial(
+                    &image_data,
+                    &shared_palette,
+                    &shared_trns,
+                    width,
+                    height,
+                    out_bit_depth,
+                    out_color_type,
+                    &trials[idx],
+                    tref.zi,
+                    true, // always capture full encoded bytes
+                    None,
+                );
+
+                // Update best + progress under lock
+                {
+                    let mut lock = best.lock().unwrap();
+                    lock.completed += 1;
+                    if trial_idat_size < lock.size && trial_idat_size > 0 {
+                        lock.size = trial_idat_size;
+                        lock.config = Some(trials[idx].clone());
+                        lock.bytes = trial_bytes;
+                    }
+                    if let Some(cb) = tref.progress_callback.as_deref() {
+                        cb(lock.completed, total_trials);
+                    }
+                }
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let lock = best.lock().unwrap();
+    match (lock.bytes.clone(), lock.config.clone()) {
+        (Some(bytes), Some(config)) => Ok(MemoryOptimizationResult {
+            optimized_bytes: bytes,
+            orig_idat_size,
+            best_idat_size: lock.size,
+            best_config: Some(config),
+                                          is_smaller: lock.size < orig_idat_size,
+        }),
+        _ => Err("All compression trials failed".to_string()),
     }
 }

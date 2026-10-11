@@ -11,7 +11,8 @@ pub struct TrialConfig {
     pub f: u8,
 }
 
-/// Contains all parsed command-line arguments.
+/// Configuration for an optimization run. Library-neutral: a file-based task
+/// fills `files`, an in-memory task fills `in_memory_source`.
 pub struct OptimizationTask {
     pub files: Vec<String>,
     pub external_input: Option<String>,
@@ -37,6 +38,49 @@ pub struct OptimizationTask {
     pub force_trials: bool,
     pub force_reenc: bool,
     pub memory_limit: f64,
+    /// Optional progress callback invoked as `(completed_trials, total_trials)`.
+    /// Used by file-based runs; in-memory runs invoke it per trial as well.
+    /// Called from any worker thread as trials complete, so it must be `Send + Sync`.
+    pub progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+    /// When true (default), apply color/bit-depth reduction heuristics before
+    /// compression trials. When false, compress the image exactly as given.
+    pub reduce_format: bool,
+    /// When set, optimise this in-memory image instead of `files`.
+    pub in_memory_source: Option<LoadedImage>,
+}
+
+impl Default for OptimizationTask {
+    fn default() -> Self {
+        Self {
+            files: Vec::new(),
+            external_input: None,
+            opt_level: 2,
+            mt: 4,
+            zi: 0,
+            zc: None,
+            zm: None,
+            zs: None,
+            f: None,
+            backup: false,
+            simulate: false,
+            quiet: false,
+            nc: false,
+            nb: false,
+            np: false,
+            nx: false,
+            nz: false,
+            out_file: None,
+            recursive: false,
+            max_depth: None,
+            show_help: false,
+            force_trials: false,
+            force_reenc: false,
+            memory_limit: 90.0,
+            progress_callback: None,
+            reduce_format: true,
+            in_memory_source: None,
+        }
+    }
 }
 
 /// A target file queued for processing.
@@ -95,4 +139,74 @@ pub struct FileState {
     pub is_processed: bool,
     pub is_prepared: bool,
     pub is_preparing: bool,
+}
+
+// ─── Progress / result callbacks ────────────────────────────────────────────
+// Added at the bottom to avoid disturbing field order above.
+
+/// Progress callback: invoked by the library whenever a file's optimization
+/// progress changes.
+///
+/// # Arguments
+/// * `file` — display name of the file currently being processed
+/// * `file_idx` — 0-based index of the current file
+/// * `file_total` — total number of files in the batch
+/// * `progress` — 0.0–1.0 within the current file; 1.0 means the file finished.
+pub type ProgressCallback = fn(file: &str, file_idx: usize, file_total: usize, progress: f64);
+
+/// Per-file completion callback: invoked once per file with the final result.
+pub type FileResultCallback = fn(file: &OptimizedFile);
+
+// ─── File progress reporting ────────────────────────────────────────────────
+
+/// Status of a file during the optimization pipeline.
+pub enum FileStatus {
+    /// File is not a valid PNG.
+    NotValidPng,
+    /// File is already at the optimal size.
+    AlreadyOptimized,
+    /// Image was opened successfully (before compression trials).
+    Opened {
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        color_type: u8,
+    },
+    /// Optimization failed.
+    Failed {
+        error: String,
+    },
+    /// Optimization completed and produced a smaller file.
+    Optimized {
+        orig_bytes: usize,
+        final_bytes: usize,
+        reduction: Option<String>,
+    },
+    /// File was skipped.
+    Skipped,
+}
+
+/// Per-file progress event delivered to the callback.
+#[derive(Debug)]
+pub struct FileProgress {
+    /// 0-based index of this file in the batch.
+    pub file_idx: usize,
+    /// Total number of files in the batch.
+    pub file_total: usize,
+    /// Display name of the file.
+    pub filename: String,
+    /// Current status.
+    pub status: FileStatus,
+}
+
+/// Scan-phase statistics (returned by `optimize_files`).
+#[derive(Debug, Default)]
+pub struct ScanSummary {
+    pub valid_pngs: usize,
+    pub already_optimized: usize,
+    pub non_pngs: usize,
+    pub files_processed: usize,
+    pub total_orig_bytes: u64,
+    pub total_final_bytes: u64,
+    pub duration_secs: f64,
 }

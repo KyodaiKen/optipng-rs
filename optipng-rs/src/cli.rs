@@ -33,6 +33,9 @@ pub fn parse_args() -> OptimizationTask {
         show_help: false,
         force_trials: false,
         force_reenc: false,
+        in_memory_source: None,
+        progress_callback: None,
+        reduce_format: true,
     };
 
     let mut i = 0;

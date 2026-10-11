@@ -5,7 +5,7 @@ use crate::OptimizationTask;
 use crate::ReductionResult;
 
 pub fn reduce_image(
-    cli: &OptimizationTask,
+    task: &OptimizationTask,
     width: u32,
     height: u32,
     color_type: u8,
@@ -23,8 +23,8 @@ pub fn reduce_image(
         out_color_type = if stride == (width as usize * 4) { 6 } else { 2 };
     }
 
-    if !cli.nx {
-        if !cli.nb {
+    if !task.nx {
+        if !task.nb {
             // 2a. Bit depth reduction (Fake 16-bit to 8-bit)
             if out_bit_depth == 16 {
                 let mut is_fake_16 = true;
@@ -50,7 +50,7 @@ pub fn reduce_image(
             }
         }
 
-        if !cli.nc {
+        if !task.nc {
             // 2b. Check opacity & reduce color type if 100% opaque
             if out_color_type == 4 || out_color_type == 6 {
                 let (bytes_to_keep, bytes_to_skip) = match (out_color_type, out_bit_depth) {
@@ -153,7 +153,7 @@ pub fn reduce_image(
             }
 
             // 2d. Reduction to Indexed / Palette
-            if !cli.np && out_bit_depth == 8 && (out_color_type == 2 || out_color_type == 6) {
+            if !task.np && out_bit_depth == 8 && (out_color_type == 2 || out_color_type == 6) {
                 let px_bytes = match out_color_type {
                     0 => 1,
                     2 => 3,

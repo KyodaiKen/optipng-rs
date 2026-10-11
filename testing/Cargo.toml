@@ -1,0 +1,8 @@
+[package]
+name = "optipng-testing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+liboptipng-rs = { path = "../liboptipng-rs" }
+decoder = { path = "../png_stream_dec/decoder" }

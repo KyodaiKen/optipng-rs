@@ -108,12 +108,14 @@ pub fn run_single_trial(
     out_color_type: u8,
     trial: &TrialConfig,
     zi: u8,
+    capture_bytes: bool,
     on_scanline_chunk: Option<&dyn Fn(usize)>,
 ) -> (usize, Option<Vec<u8>>) {
     let total_rows = height as usize;
     let row_bytes = if total_rows > 0 { image_data.len() / total_rows } else { 0 };
     let chunk_rows = 250;
     let is_zopfli = zi == 2;
+    let should_capture = is_zopfli || capture_bytes;
 
     let mut trial_output_buffer = Vec::new();
     let mut dummy_written: usize = 0;
@@ -154,7 +156,7 @@ pub fn run_single_trial(
     let text_keys = [c_key.as_ptr()];
     let text_vals = [c_val.as_ptr()];
 
-    let (write_cb_fn, user_data_ptr, text_k_ptr, text_v_ptr, text_cnt) = if is_zopfli {
+    let (write_cb_fn, user_data_ptr, text_k_ptr, text_v_ptr, text_cnt) = if should_capture {
         (
             buffer_write_cb as PngWriteCallback,
             &mut trial_output_buffer as *mut _ as *mut c_void,
@@ -211,7 +213,7 @@ pub fn run_single_trial(
     let trial_idat_size = close_png_encode_get_idat_size(enc);
 
     if encoded_rows == total_rows && trial_idat_size > 0 {
-        let bytes_opt = if is_zopfli { Some(trial_output_buffer) } else { None };
+        let bytes_opt = if should_capture { Some(trial_output_buffer) } else { None };
         (trial_idat_size, bytes_opt)
     } else {
         (usize::MAX, None)

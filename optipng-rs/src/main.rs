@@ -4,7 +4,7 @@
 mod cli;
 
 use liboptipng_rs::OptimizationTask;
-use liboptipng_rs::run_optimization;
+use liboptipng_rs::optimize_files;
 
 fn main() {
     let cli: OptimizationTask = cli::parse_args();
@@ -22,5 +22,5 @@ fn main() {
         std::process::exit(1);
     }
 
-    run_optimization(cli);
+    optimize_files(cli);
 }
