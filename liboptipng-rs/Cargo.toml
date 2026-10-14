@@ -13,5 +13,3 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 decoder = { path = "../png_stream_dec/decoder" }
 encoder = { path = "../png_stream_enc/encoder" }
 sysinfo = "0.30"
-console = "0.15"
-indicatif = "0.17"

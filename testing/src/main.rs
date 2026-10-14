@@ -10,7 +10,7 @@ use std::fs;
 use pngstreamdec::{
     close_png, decode_scanlines, open_png, png_get_idat_size, png_set_count_idat_size,
 };
-use liboptipng_rs::{OptimizationTask, LoadedImage, optimize_memory};
+use liboptipng_rs::{OptimizationTask, LoadedImage, optimize_memory, PipelineEvent};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -87,10 +87,12 @@ fn main() {
     task.mt = 32;
 
     // Progress callback
-    task.progress_callback = Some(Box::new(|completed, total| {
-        let pct = if total > 0 { completed * 100 / total } else { 0 };
-        eprint!("\r    progress: {:>3}%\x1b[K", pct);
-        if completed >= total { eprintln!(); }
+    task.event_callback = Some(Box::new(|ev: &PipelineEvent| {
+        if let PipelineEvent::Progress { overall_frac, .. } = ev {
+            let pct = (*overall_frac * 100.0) as usize;
+            eprint!("\r    progress: {:>3}%\x1b[K", pct);
+            if *overall_frac >= 1.0 { eprintln!(); }
+        }
     }));
 
     // ── Run optimization ─────────────────────────────────────────────────

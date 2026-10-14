@@ -184,8 +184,10 @@ impl OptipngParams {
         task.in_memory_source = Some(loaded);
         if let Some(cb) = self.progress_cb {
             let user = CUserPtr(self.progress_user_data);
-            task.progress_callback = Some(Box::new(move |completed, total| {
-                cb(completed, total, user.as_ptr())
+            task.event_callback = Some(Box::new(move |ev: &crate::PipelineEvent| {
+                if let crate::PipelineEvent::Progress { completed_files, total_files, .. } = ev {
+                    cb(*completed_files, *total_files, user.as_ptr());
+                }
             }));
         }
         task

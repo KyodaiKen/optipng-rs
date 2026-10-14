@@ -1,4 +1,9 @@
-/// Multi-threaded optimization pipeline: scanning, scheduling, trial dispatch, progress UI.
+/// Multi-threaded optimization pipeline: scanning, scheduling, trial dispatch.
+///
+/// The library is UI-agnostic: it never touches the console directly. Instead it
+/// emits `PipelineEvent`s through `OptimizationTask.event_callback`, and the
+/// owning application (CLI / FFI) renders them. A quiet run installs `None`, so
+/// nothing is emitted.
 
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -22,29 +27,21 @@ use crate::reducer::reduce_image;
 use crate::trials::{build_trial_list, get_opt_combinations, get_zopfli_opt_combinations, run_single_trial, TrialConfig};
 use crate::utils::*;
 
-/// Top-level entry point: validates inputs, scans for targets, runs the multi-threaded pipeline, prints summary.
+type EventSink = dyn Fn(&PipelineEvent) + Send + Sync;
+
+/// Emit an event through the optional callback (no-op when unset, i.e. quiet).
+fn emit(cb: Option<&EventSink>, ev: &PipelineEvent) {
+    if let Some(cb) = cb {
+        cb(ev);
+    }
+}
+
+/// Top-level entry point: validates inputs, scans for targets, runs the multi-threaded pipeline.
 pub fn optimize_files(task: OptimizationTask) {
     let mut input_paths: Vec<(PathBuf, bool)> = Vec::new();
     let mut visited_dirs = HashSet::new();
     let mut visited_files = HashSet::new();
     let base_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-    let scan_pb = if !task.quiet {
-        let pb = indicatif::ProgressBar::new_spinner();
-        pb.enable_steady_tick(std::time::Duration::from_millis(100));
-        let term_w = get_terminal_width();
-        let bar_w = term_w.saturating_sub(12).max(10);
-        let template = format!("{{spinner:.dim}} {{msg}} {{bar:{bar_w}.cyan.bold/cyan}}");
-        let style = indicatif::ProgressStyle::with_template(&template)
-            .unwrap()
-            .tick_chars(".oOo.")
-            .progress_chars("█▉▊▋▌▍▎▏ ");
-        pb.set_style(style);
-        pb.set_message(format!("{:>6}", 0));
-        Some(pb)
-    } else {
-        None
-    };
 
     let mut stats = ScanStats::default();
 
@@ -67,16 +64,12 @@ pub fn optimize_files(task: OptimizationTask) {
                     &mut visited_dirs,
                     &mut visited_files,
                     &mut found_files,
-                    scan_pb.as_ref(),
+                    task.event_callback.as_deref(),
                     &mut stats,
                 );
             } else if path.is_file() {
                 let canonical_file = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 if visited_files.insert(canonical_file) {
-                    if let Some(ref pb) = scan_pb {
-                        pb.tick();
-                    }
-
                     let rel_path = if task.recursive {
                         path.strip_prefix(&base_dir)
                             .unwrap_or(&path)
@@ -91,14 +84,7 @@ pub fn optimize_files(task: OptimizationTask) {
                     let (is_valid, is_already_optimized) = check_png_file(&path, task.force_trials);
                     if !is_valid {
                         stats.non_pngs += 1;
-                        let error_mark = console::style("✖").red().bright();
-                        if !task.quiet {
-                            if let Some(ref pb) = scan_pb {
-                                pb.println(format!("{} {} is not a valid PNG file", error_mark, rel_path));
-                            } else {
-                                eprintln!("{} {} is not a valid PNG file", error_mark, rel_path);
-                            }
-                        }
+                        emit(task.event_callback.as_deref(), &PipelineEvent::ScanNonPng { rel_path });
                         continue;
                     }
 
@@ -106,16 +92,10 @@ pub fn optimize_files(task: OptimizationTask) {
 
                     if is_already_optimized {
                         stats.already_optimized += 1;
-                        if let Some(ref pb) = scan_pb {
-                            pb.println(format!("- {} -> skipped (already optimized)", rel_path));
-                        } else if !task.quiet {
-                            eprintln!("- {} -> skipped (already optimized)", rel_path);
-                        }
+                        emit(task.event_callback.as_deref(), &PipelineEvent::ScanSkipped { rel_path });
                     } else {
                         found_files.push(path);
-                        if let Some(ref pb) = scan_pb {
-                            pb.set_message(format!("{:>6}", found_files.len()));
-                        }
+                        emit(task.event_callback.as_deref(), &PipelineEvent::ScanTick { found: found_files.len() });
                     }
                 }
             }
@@ -126,17 +106,15 @@ pub fn optimize_files(task: OptimizationTask) {
         }
     }
 
-    if let Some(ref pb) = scan_pb {
-        pb.finish_and_clear();
-    }
-
-    if !task.quiet {
-        println!("\nSCAN COMPLETED:");
-        println!("  Valid PNG files found  : {}", stats.valid_pngs);
-        println!("  Already optimized .... : {}", stats.already_optimized);
-        println!("  Non-PNG / invalid files: {}", stats.non_pngs);
-        println!("  Files to be processed  : {}\n", stats.valid_pngs.saturating_sub(stats.already_optimized));
-    }
+    emit(
+        task.event_callback.as_deref(),
+        &PipelineEvent::ScanDone {
+            valid_pngs: stats.valid_pngs,
+            already_optimized: stats.already_optimized,
+            non_pngs: stats.non_pngs,
+            to_process: stats.valid_pngs.saturating_sub(stats.already_optimized),
+        },
+    );
 
     let is_multi_file = input_paths.len() > 1;
 
@@ -148,7 +126,12 @@ pub fn optimize_files(task: OptimizationTask) {
             let out_p = PathBuf::from(out_arg);
             if is_multi_file || out_p.is_dir() || out_arg.ends_with('/') || out_arg.ends_with('\\') {
                 if let Err(e) = fs::create_dir_all(&out_p) {
-                    eprintln!("{}", format_error(&format!("Failed to create output directory {:?}: {}", out_p, e)));
+                    emit(
+                        task.event_callback.as_deref(),
+                        &PipelineEvent::Fatal {
+                            message: format!("Failed to create output directory {:?}: {}", out_p, e),
+                        },
+                    );
                     std::process::exit(1);
                 }
                 out_p.join(in_path.file_name().unwrap_or_default())
@@ -216,20 +199,6 @@ pub fn optimize_files(task: OptimizationTask) {
         });
     }
 
-    let multi_progress = if !task.quiet {
-        Some(Arc::new(indicatif::MultiProgress::new()))
-    } else {
-        None
-    };
-
-    let overall_pb = multi_progress
-        .as_ref()
-        .map(|mp| {
-            let pb = mp.add(indicatif::ProgressBar::new(10000));
-            pb.enable_steady_tick(std::time::Duration::from_millis(100));
-            pb
-        });
-
     let scheduler_inner = Scheduler {
         files: file_states,
         active_indices: Vec::new(),
@@ -237,9 +206,7 @@ pub fn optimize_files(task: OptimizationTask) {
         finished_files: 0,
         total_orig_bytes: 0,
         total_new_bytes: 0,
-        overall_pb,
-        last_overall_pb_update: None,
-        multi_progress,
+        last_progress_emit: None,
     };
 
     run_pipeline(task, scheduler_inner);
@@ -303,7 +270,7 @@ fn scan_directory(
     visited_dirs: &mut HashSet<PathBuf>,
     visited_files: &mut HashSet<PathBuf>,
     found_files: &mut Vec<PathBuf>,
-    scan_pb: Option<&indicatif::ProgressBar>,
+    cb: Option<&EventSink>,
     stats: &mut ScanStats,
 ) -> io::Result<()> {
     let canonical_dir = match fs::canonicalize(dir) {
@@ -346,7 +313,7 @@ fn scan_directory(
                         visited_dirs,
                         visited_files,
                         found_files,
-                        scan_pb,
+                        cb,
                         stats,
                     )?;
                 }
@@ -359,10 +326,6 @@ fn scan_directory(
             if is_png_ext {
                 let canonical_file = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
                 if visited_files.insert(canonical_file) {
-                    if let Some(pb) = scan_pb {
-                        pb.tick();
-                    }
-
                     let rel_path = if recursive {
                         path.strip_prefix(base_dir)
                             .unwrap_or(&path)
@@ -378,12 +341,7 @@ fn scan_directory(
 
                     if !is_valid {
                         stats.non_pngs += 1;
-                        let error_mark = console::style("✖").red().bright();
-                        if let Some(pb) = scan_pb {
-                            pb.println(format!("{} {} is not a valid PNG file", error_mark, rel_path));
-                        } else {
-                            eprintln!("{} {} is not a valid PNG file", error_mark, rel_path);
-                        }
+                        emit(cb, &PipelineEvent::ScanNonPng { rel_path });
                         continue;
                     }
 
@@ -391,18 +349,12 @@ fn scan_directory(
 
                     if is_already_optimized {
                         stats.already_optimized += 1;
-                        if let Some(pb) = scan_pb {
-                            pb.println(format!("- {} -> skipped (already optimized)", rel_path));
-                        } else {
-                            eprintln!("- {} -> skipped (already optimized)", rel_path);
-                        }
+                        emit(cb, &PipelineEvent::ScanSkipped { rel_path });
                         continue;
                     }
 
                     found_files.push(path);
-                    if let Some(pb) = scan_pb {
-                        pb.set_message(format!("{:>6}", found_files.len()));
-                    }
+                    emit(cb, &PipelineEvent::ScanTick { found: found_files.len() });
                 }
             } else {
                 stats.non_pngs += 1;
@@ -621,9 +573,7 @@ struct Scheduler {
     finished_files: usize,
     total_orig_bytes: u64,
     total_new_bytes: u64,
-    overall_pb: Option<indicatif::ProgressBar>,
-    last_overall_pb_update: Option<Instant>,
-    multi_progress: Option<Arc<indicatif::MultiProgress>>,
+    last_progress_emit: Option<Instant>,
 }
 
 /// Defines a single work task assigned to a thread.
@@ -681,91 +631,56 @@ fn format_reduction_info(state: &FileState, zi: u8) -> String {
     }
 }
 
-/// Dynamically calculates column widths for the progress UI.
-fn calculate_column_widths(term_width: usize) -> (usize, usize, usize, usize) {
-    let w = term_width.max(60);
-    let fn_w = (w as f64 * 0.50) as usize;
-    let trials_w = 20;
-    let pct_w = 10;
-    let fixed = 7;
-    let used = fn_w + trials_w + pct_w + fixed;
-    let bar_w = if w > used { w - used } else { 10 };
-    (fn_w, trials_w, bar_w, pct_w)
-}
-
-/// Returns the current terminal column width.
-fn get_terminal_width() -> usize {
-    console::Term::stdout().size().1 as usize
-}
-
 impl Scheduler {
-    /// Formats and updates the overall progress bar.
-    fn update_overall_pb(&mut self, pb: &indicatif::ProgressBar, term_width: usize, force: bool) {
+    /// Computes the overall progress fraction and emits a `Progress` event,
+    /// throttled to ~10 Hz for non-terminal updates. The library only reports
+    /// the numbers; the application owns the bar rendering.
+    fn emit_progress(&mut self, cb: Option<&EventSink>) {
         let total_files = self.files.len();
         if total_files == 0 {
-            pb.set_position(10000);
             return;
         }
 
-        let mut total_progress_units = 0.0f64;
-        let mut completed_files = 0usize;
-
+        let mut units = 0.0f64;
+        let mut completed = 0usize;
         for f in &self.files {
             if f.is_processed || f.is_skipped {
-                total_progress_units += 1.0;
-                completed_files += 1;
+                units += 1.0;
+                completed += 1;
             } else if f.total_scanlines > 0 {
-                let frac = (f.completed_scanlines as f64 / f.total_scanlines as f64).min(1.0);
-                total_progress_units += frac;
+                units += (f.completed_scanlines as f64 / f.total_scanlines as f64).min(1.0);
             } else if f.total_trials > 0 {
-                let frac = (f.completed_trials as f64 / f.total_trials as f64).min(1.0);
-                total_progress_units += frac;
+                units += (f.completed_trials as f64 / f.total_trials as f64).min(1.0);
             }
         }
+        let frac = units / total_files as f64;
 
-        let overall_frac = total_progress_units / total_files as f64;
-
-        if !force && overall_frac < 1.0 {
-            if let Some(last) = self.last_overall_pb_update {
+        if frac < 1.0 {
+            if let Some(last) = self.last_progress_emit {
                 if last.elapsed() < std::time::Duration::from_millis(100) {
                     return;
                 }
             }
         }
+        self.last_progress_emit = Some(Instant::now());
 
-        self.last_overall_pb_update = Some(Instant::now());
-
-        let (fn_w, _, bar_w, pct_w) = calculate_column_widths(term_width);
-
-        let status_str = format!(
-            "Overall Progress: {}/{} {}",
-            completed_files,
-            total_files,
-            format!("{:.2}%", overall_frac * 100.0)
-        );
-        let truncated_status = truncate_middle(&status_str, fn_w);
-        let msg = format!("{:<width$}", truncated_status, width = fn_w);
-
-        let savings_bytes = self.total_orig_bytes.saturating_sub(self.total_new_bytes);
-        let savings_pct = if self.total_orig_bytes > 0 {
-            (savings_bytes as f64 / self.total_orig_bytes as f64) * 100.0
+        let savings = self.total_orig_bytes.saturating_sub(self.total_new_bytes);
+        let pct = if self.total_orig_bytes > 0 {
+            (savings as f64 / self.total_orig_bytes as f64) * 100.0
         } else {
             0.0
         };
-        let extra_str = format!("{} ({:.1}%)", format_bytes(savings_bytes as usize), savings_pct);
-        let extra = format!("{:>width$}", extra_str, width = pct_w);
 
-        let template = format!("{{spinner:.cyan.bold}} {{msg}} {{bar:{bar_w}.cyan.bold/cyan}} {extra}");
-        let style = indicatif::ProgressStyle::with_template(&template)
-            .unwrap()
-            .tick_chars(".oOo.")
-            .progress_chars("█▉▊▋▌▍▎▏ ");
-
-        pb.set_style(style);
-        pb.set_message(msg);
-
-        let pos = (overall_frac * 10000.0) as u64;
-        pb.set_position(pos.min(10000));
+        emit(
+            cb,
+            &PipelineEvent::Progress {
+                completed_files: completed,
+                total_files,
+                overall_frac: frac,
+                savings_bytes: savings,
+                savings_pct: pct,
+            },
+        );
     }
 }
 
@@ -839,7 +754,7 @@ fn finalize_file_write(task: &OptimizationTask, file_state: &mut FileState) -> u
         };
 
         let (trns_ptr, trns_len) = match &file_state.shared_trns {
-            Some(trns) => (trns.as_ptr(), trns.len()),
+            Some(tr) => (tr.as_ptr(), tr.len()),
             None => (std::ptr::null(), 0),
         };
 
@@ -965,9 +880,8 @@ fn run_pipeline(task: OptimizationTask, scheduler_inner: Scheduler) {
                             drop(lock);
 
                             let prep = prepare_file_data(&task_ref, &task);
+                            let cb = task_ref.event_callback.as_deref();
                             lock = scheduler_clone.lock().unwrap();
-                            let mp = lock.multi_progress.clone();
-                            let overall_pb = lock.overall_pb.clone();
 
                             let (has_error, is_skipped_or_empty, rel_path, orig_size, orig_color_type, orig_bit_depth, width, height) = {
                                 let state = &mut lock.files[next_idx];
@@ -1010,61 +924,44 @@ fn run_pipeline(task: OptimizationTask, scheduler_inner: Scheduler) {
                             };
 
                             if has_error {
-                                let err = lock.files[next_idx].error_msg.as_ref().unwrap();
-                                if let Some(ref mp_handle) = mp {
-                                    let _ = mp_handle.println(format_error(&format!("{} - Error: {}", rel_path, err)));
-                                } else if !task_ref.quiet {
-                                    eprintln!("{}", format_error(&format!("{} - Error: {}", rel_path, err)));
-                                }
+                                let err = lock.files[next_idx].error_msg.as_ref().unwrap().clone();
+                                emit(cb, &PipelineEvent::FileError { rel_path, message: err });
 
                                 lock.finished_files += 1;
                                 lock.total_orig_bytes += orig_size;
                                 lock.total_new_bytes += orig_size;
 
-                                if let Some(ref opb) = overall_pb {
-                                    let term_w = get_terminal_width();
-                                    lock.update_overall_pb(opb, term_w, true);
-                                }
+                                lock.emit_progress(cb);
 
                                 condvar_clone.notify_all();
                                 continue;
                             }
 
                             if is_skipped_or_empty {
-                                if let Some(ref mp_handle) = mp {
-                                    let _ = mp_handle.println(format!("- {} -> skipped (already optimized)", rel_path));
-                                } else if !task_ref.quiet {
-                                    eprintln!("- {} -> skipped (already optimized)", rel_path);
-                                }
+                                emit(cb, &PipelineEvent::ScanSkipped { rel_path });
 
                                 lock.finished_files += 1;
                                 lock.total_orig_bytes += orig_size;
                                 lock.total_new_bytes += orig_size;
 
-                                if let Some(ref opb) = overall_pb {
-                                    let term_w = get_terminal_width();
-                                    lock.update_overall_pb(opb, term_w, true);
-                                }
+                                lock.emit_progress(cb);
 
                                 condvar_clone.notify_all();
                                 continue;
                             }
 
-                            if let Some(ref mp_handle) = mp {
-                                let color_name = color_type_short_name(orig_color_type);
-                                let _ = mp_handle.println(format!(
-                                    "Opened {} -> {} x {} / {} bit / {}",
-                                    rel_path, width, height, orig_bit_depth, color_name
-                                ));
-                            } else if !task_ref.quiet {
-                                let color_name = color_type_short_name(orig_color_type);
-                                eprintln!("Opened {} -> {} x {} / {} bit / {}", rel_path, width, height, orig_bit_depth, color_name);
-                            }
+                            emit(
+                                cb,
+                                &PipelineEvent::FileOpened {
+                                    rel_path,
+                                    width,
+                                    height,
+                                    bit_depth: orig_bit_depth,
+                                    color_type: orig_color_type,
+                                },
+                            );
 
-                            if let Some(ref opb) = overall_pb {
-                                let term_w = get_terminal_width();
-                                lock.update_overall_pb(opb, term_w, false);
-                            }
+                            lock.emit_progress(cb);
 
                             let trial_idx = lock.files[next_idx].next_trial_idx;
                             lock.files[next_idx].next_trial_idx += 1;
@@ -1115,13 +1012,11 @@ fn run_pipeline(task: OptimizationTask, scheduler_inner: Scheduler) {
 
                         let on_scanlines = |chunk_rows: usize| {
                             if task_ref.zi == 1 {
+                                let cb = task_ref.event_callback.as_deref();
                                 let mut lock = sched_cb.lock().unwrap();
                                 let state = &mut lock.files[file_idx];
                                 state.completed_scanlines += chunk_rows;
-                                if let Some(opb) = lock.overall_pb.clone() {
-                                    let term_w = get_terminal_width();
-                                    lock.update_overall_pb(&opb, term_w, false);
-                                }
+                                lock.emit_progress(cb);
                             }
                         };
 
@@ -1139,8 +1034,8 @@ fn run_pipeline(task: OptimizationTask, scheduler_inner: Scheduler) {
                             Some(&on_scanlines),
                         );
 
+                        let cb = task_ref.event_callback.as_deref();
                         let mut lock = scheduler_clone.lock().unwrap();
-                        let mp = lock.multi_progress.clone();
                         {
                             let state = &mut lock.files[file_idx];
                             state.completed_trials += 1;
@@ -1154,10 +1049,7 @@ fn run_pipeline(task: OptimizationTask, scheduler_inner: Scheduler) {
                             }
                         }
 
-                        if let Some(ref opb) = lock.overall_pb.clone() {
-                            let term_w = get_terminal_width();
-                            lock.update_overall_pb(&opb, term_w, false);
-                        }
+                        lock.emit_progress(cb);
 
                         if lock.files[file_idx].completed_trials == lock.files[file_idx].total_trials {
                             let actual_size = finalize_file_write(&task_ref, &mut lock.files[file_idx]);
@@ -1176,44 +1068,22 @@ fn run_pipeline(task: OptimizationTask, scheduler_inner: Scheduler) {
 
                             let final_size = if actual_size > 0 { actual_size } else { orig_size };
 
-                            let sav_str = if is_skipped {
-                                "skipped".to_string()
-                            } else if final_size < orig_size {
-                                let saved = orig_size - final_size;
-                                let pct = (saved as f64 / orig_size as f64) * 100.0;
-                                format!("saved {} ({:.1}%)", format_bytes(saved as usize), pct)
-                            } else if final_size == orig_size {
-                                "no size reduction".to_string()
-                            } else {
-                                let diff = final_size - orig_size;
-                                let pct = (diff as f64 / orig_size as f64) * 100.0;
-                                format!("+{} (+{:.1}%)", format_bytes(diff as usize), pct)
-                            };
-
-                            if let Some(ref mp_handle) = mp {
-                                if is_skipped {
-                                    let _ = mp_handle.println(format!("- {} -> skipped", rel_path));
-                                } else {
-                                    let check_mark = console::style("✓").green().bright();
-                                    let _ = mp_handle
-                                        .println(format!("{} {} [{}] -> {}", check_mark, rel_path, red_str, sav_str));
-                                }
-                            } else if !task_ref.quiet {
-                                if is_skipped {
-                                    eprintln!("- {} -> skipped", rel_path);
-                                } else {
-                                    eprintln!("{} [{}] -> {}", rel_path, red_str, sav_str);
-                                }
-                            }
+                            emit(
+                                cb,
+                                &PipelineEvent::FileDone {
+                                    rel_path,
+                                    orig_bytes: orig_size,
+                                    final_bytes: final_size,
+                                    reduction: if is_skipped { None } else { Some(red_str) },
+                                    skipped: is_skipped,
+                                },
+                            );
 
                             lock.finished_files += 1;
                             lock.total_orig_bytes += orig_size;
                             lock.total_new_bytes += final_size;
 
-                            if let Some(ref opb) = lock.overall_pb.clone() {
-                                let term_w = get_terminal_width();
-                                lock.update_overall_pb(opb, term_w, true);
-                            }
+                            lock.emit_progress(cb);
 
                             lock.active_indices.retain(|&i| i != file_idx);
                             condvar_clone.notify_all();
@@ -1232,41 +1102,24 @@ fn run_pipeline(task: OptimizationTask, scheduler_inner: Scheduler) {
     }
 
     let duration = start_time.elapsed();
-    let final_sched = scheduler.lock().unwrap();
 
-    if let Some(ref opb) = final_sched.overall_pb {
-        opb.finish_and_clear();
-    }
-
-    if !task_arc.quiet {
-        let total_orig = final_sched.total_orig_bytes;
-        let total_new = final_sched.total_new_bytes;
-        let saved_bytes = total_orig.saturating_sub(total_new);
-        let pct = if total_orig > 0 {
-            (saved_bytes as f64 / total_orig as f64) * 100.0
+    {
+        let sched = scheduler.lock().unwrap();
+        let saved = sched.total_orig_bytes.saturating_sub(sched.total_new_bytes);
+        let _pct = if sched.total_orig_bytes > 0 {
+            (saved as f64 / sched.total_orig_bytes as f64) * 100.0
         } else {
             0.0
         };
-
-        println!("\nSUMMARY OF PROCESSED FILES");
-        println!("  Files processed ..... : {}", final_sched.finished_files);
-        println!(
-            "  Total original size . : {} bytes ({})",
-            total_orig,
-            format_bytes(total_orig as usize)
+        emit(
+            task_arc.event_callback.as_deref(),
+            &PipelineEvent::Summary {
+                files_processed: sched.finished_files,
+                total_orig_bytes: sched.total_orig_bytes,
+                total_new_bytes: sched.total_new_bytes,
+                duration_secs: duration.as_secs_f64(),
+            },
         );
-        println!(
-            "  Total new size ...... : {} bytes ({})",
-            total_new,
-            format_bytes(total_new as usize)
-        );
-        println!(
-            "  Total size decrease . : {} bytes ({}) ({:.2}%)",
-            saved_bytes,
-            format_bytes(saved_bytes as usize),
-            pct
-        );
-        println!("  Total processing time : {}", format_duration(duration));
     }
 }
 
@@ -1307,9 +1160,9 @@ pub fn optimize_memory(task: OptimizationTask) -> Result<MemoryOptimizationResul
     use std::thread;
 
     let img = task
-    .in_memory_source
-    .as_ref()
-    .ok_or_else(|| "in_memory_source is not set".to_string())?;
+        .in_memory_source
+        .as_ref()
+        .ok_or_else(|| "in_memory_source is not set".to_string())?;
 
     let width = img.width;
     let height = img.height;
@@ -1326,9 +1179,9 @@ pub fn optimize_memory(task: OptimizationTask) -> Result<MemoryOptimizationResul
         );
         (
             rr.out_bit_depth,
-         rr.out_color_type,
-         rr.final_palette.map(Arc::new),
-         rr.final_trns.map(Arc::new),
+            rr.out_color_type,
+            rr.final_palette.map(Arc::new),
+            rr.final_trns.map(Arc::new),
         )
     } else {
         (orig_bit_depth, orig_color_type, None, None)
@@ -1341,18 +1194,18 @@ pub fn optimize_memory(task: OptimizationTask) -> Result<MemoryOptimizationResul
         let (def_zc, def_f) = get_zopfli_opt_combinations(task.opt_level);
         (
             task.zc.clone().unwrap_or(def_zc),
-         vec![8],
-         vec![0],
-         task.f.clone().unwrap_or(def_f),
+            vec![8],
+            vec![0],
+            task.f.clone().unwrap_or(def_f),
         )
     } else {
         let (def_zc, def_zm, def_zs, def_f) =
-        get_opt_combinations(task.opt_level, out_color_type, out_bit_depth);
+            get_opt_combinations(task.opt_level, out_color_type, out_bit_depth);
         (
             task.zc.clone().unwrap_or(def_zc),
-         task.zm.clone().unwrap_or(def_zm),
-         task.zs.clone().unwrap_or(def_zs),
-         task.f.clone().unwrap_or(def_f),
+            task.zm.clone().unwrap_or(def_zm),
+            task.zs.clone().unwrap_or(def_zs),
+            task.f.clone().unwrap_or(def_f),
         )
     };
 
@@ -1417,8 +1270,14 @@ pub fn optimize_memory(task: OptimizationTask) -> Result<MemoryOptimizationResul
                         lock.config = Some(trials[idx].clone());
                         lock.bytes = trial_bytes;
                     }
-                    if let Some(cb) = tref.progress_callback.as_deref() {
-                        cb(lock.completed, total_trials);
+                    if let Some(cb) = tref.event_callback.as_deref() {
+                        cb(&PipelineEvent::Progress {
+                            completed_files: 1,
+                            total_files: 1,
+                            overall_frac: lock.completed as f64 / total_trials as f64,
+                            savings_bytes: 0,
+                            savings_pct: 0.0,
+                        });
                     }
                 }
             }
@@ -1436,7 +1295,7 @@ pub fn optimize_memory(task: OptimizationTask) -> Result<MemoryOptimizationResul
             orig_idat_size,
             best_idat_size: lock.size,
             best_config: Some(config),
-                                          is_smaller: lock.size < orig_idat_size,
+            is_smaller: lock.size < orig_idat_size,
         }),
         _ => Err("All compression trials failed".to_string()),
     }

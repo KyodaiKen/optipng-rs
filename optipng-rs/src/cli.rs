@@ -34,7 +34,7 @@ pub fn parse_args() -> OptimizationTask {
         force_trials: false,
         force_reenc: false,
         in_memory_source: None,
-        progress_callback: None,
+        event_callback: None,
         reduce_format: true,
     };
 

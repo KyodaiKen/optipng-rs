@@ -38,10 +38,11 @@ pub struct OptimizationTask {
     pub force_trials: bool,
     pub force_reenc: bool,
     pub memory_limit: f64,
-    /// Optional progress callback invoked as `(completed_trials, total_trials)`.
-    /// Used by file-based runs; in-memory runs invoke it per trial as well.
-    /// Called from any worker thread as trials complete, so it must be `Send + Sync`.
-    pub progress_callback: Option<Box<dyn Fn(usize, usize) + Send + Sync>>,
+    /// Optional event sink. The library is UI‑agnostic: it only *emits*
+    /// `PipelineEvent`s. The owning application (CLI / FFI) decides how to
+    /// render them. Install `None` for quiet runs so nothing is emitted.
+    /// Called from any worker thread, so it must be `Send + Sync`.
+    pub event_callback: Option<Box<dyn Fn(&PipelineEvent) + Send + Sync>>,
     /// When true (default), apply color/bit-depth reduction heuristics before
     /// compression trials. When false, compress the image exactly as given.
     pub reduce_format: bool,
@@ -76,7 +77,7 @@ impl Default for OptimizationTask {
             force_trials: false,
             force_reenc: false,
             memory_limit: 90.0,
-            progress_callback: None,
+            event_callback: None,
             reduce_format: true,
             in_memory_source: None,
         }
@@ -141,72 +142,59 @@ pub struct FileState {
     pub is_preparing: bool,
 }
 
-// ─── Progress / result callbacks ────────────────────────────────────────────
-// Added at the bottom to avoid disturbing field order above.
+// ─── Pipeline events (library → application feedback channel) ──────────────
 
-/// Progress callback: invoked by the library whenever a file's optimization
-/// progress changes.
-///
-/// # Arguments
-/// * `file` — display name of the file currently being processed
-/// * `file_idx` — 0-based index of the current file
-/// * `file_total` — total number of files in the batch
-/// * `progress` — 0.0–1.0 within the current file; 1.0 means the file finished.
-pub type ProgressCallback = fn(file: &str, file_idx: usize, file_total: usize, progress: f64);
-
-/// Per-file completion callback: invoked once per file with the final result.
-pub type FileResultCallback = fn(file: &OptimizedFile);
-
-// ─── File progress reporting ────────────────────────────────────────────────
-
-/// Status of a file during the optimization pipeline.
-pub enum FileStatus {
-    /// File is not a valid PNG.
-    NotValidPng,
-    /// File is already at the optimal size.
-    AlreadyOptimized,
-    /// Image was opened successfully (before compression trials).
-    Opened {
+/// Discrete, render-agnostic feedback emitted by the pipeline. The application
+/// owns all styling, bars and console I/O; the library only supplies the data.
+#[derive(Debug, Clone)]
+pub enum PipelineEvent {
+    /// A file was visited during scanning; `found` is the running count of
+    /// valid, non-optimized files queued so far (drives the scan spinner).
+    ScanTick { found: usize },
+    /// A file was found but is not a valid PNG.
+    ScanNonPng { rel_path: String },
+    /// A file was found but is already optimized (skipped during scan).
+    ScanSkipped { rel_path: String },
+    /// Scanning finished.
+    ScanDone {
+        valid_pngs: usize,
+        already_optimized: usize,
+        non_pngs: usize,
+        to_process: usize,
+    },
+    /// A file's pixels were decoded and reduction applied.
+    FileOpened {
+        rel_path: String,
         width: u32,
         height: u32,
         bit_depth: u8,
         color_type: u8,
     },
-    /// Optimization failed.
-    Failed {
-        error: String,
+    /// A file failed to decode / prepare.
+    FileError { rel_path: String, message: String },
+    /// Overall progress snapshot (drives the live progress bar in the CLI).
+    Progress {
+        completed_files: usize,
+        total_files: usize,
+        overall_frac: f64, // 0.0..=1.0
+        savings_bytes: u64,
+        savings_pct: f64,  // 0.0..=100.0
     },
-    /// Optimization completed and produced a smaller file.
-    Optimized {
-        orig_bytes: usize,
-        final_bytes: usize,
+    /// A file finished optimization.
+    FileDone {
+        rel_path: String,
+        orig_bytes: u64,
+        final_bytes: u64,
         reduction: Option<String>,
+        skipped: bool,
     },
-    /// File was skipped.
-    Skipped,
-}
-
-/// Per-file progress event delivered to the callback.
-#[derive(Debug)]
-pub struct FileProgress {
-    /// 0-based index of this file in the batch.
-    pub file_idx: usize,
-    /// Total number of files in the batch.
-    pub file_total: usize,
-    /// Display name of the file.
-    pub filename: String,
-    /// Current status.
-    pub status: FileStatus,
-}
-
-/// Scan-phase statistics (returned by `optimize_files`).
-#[derive(Debug, Default)]
-pub struct ScanSummary {
-    pub valid_pngs: usize,
-    pub already_optimized: usize,
-    pub non_pngs: usize,
-    pub files_processed: usize,
-    pub total_orig_bytes: u64,
-    pub total_final_bytes: u64,
-    pub duration_secs: f64,
+    /// The whole run finished (drives the summary block).
+    Summary {
+        files_processed: usize,
+        total_orig_bytes: u64,
+        total_new_bytes: u64,
+        duration_secs: f64,
+    },
+    /// An unrecoverable setup error; the application should print + exit non-zero.
+    Fatal { message: String },
 }
