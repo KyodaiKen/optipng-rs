@@ -52,8 +52,8 @@ fn terminal_width() -> usize {
 /// layout: ~50% for the status text, ~10 for the savings, rest for the bar).
 fn column_widths(term_width: usize) -> (usize, usize, usize) {
     let w = term_width.max(60);
-    let fn_w = (w as f64 * 0.50) as usize;
-    let pct_w = 10;
+    let fn_w = 40 as usize;
+    let pct_w = 20;
     let used = fn_w + pct_w + 7;
     let bar_w = if w > used { w - used } else { 10 };
     (fn_w, bar_w, pct_w)
@@ -122,10 +122,7 @@ impl Ui {
                 let error_mark = console::style("✖").red().bright();
                 let _ = pb.println(format!("{} {} is not a valid PNG file", error_mark, rel_path));
             }
-            PipelineEvent::ScanSkipped { rel_path } => {
-                let pb = self.ensure_scan();
-                let _ = pb.println(format!("- {} -> skipped (already optimized)", rel_path));
-            }
+            PipelineEvent::ScanSkipped { .. } => {}
             PipelineEvent::ScanDone {
                 valid_pngs,
                 already_optimized,
@@ -171,7 +168,7 @@ impl Ui {
                 let (fn_w, bar_w, pct_w) = column_widths(terminal_width());
 
                 let status_str = format!(
-                    "Overall Progress: {}/{} {:.2}%",
+                    "{}/{} {:.4}%",
                     completed_files,
                     total_files,
                     overall_frac * 100.0
